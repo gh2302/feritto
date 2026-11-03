@@ -2,7 +2,7 @@ PREFIX ?= $(HOME)/.local
 DESTDIR ?=
 CARGO ?= cargo
 
-.PHONY: build check test test-x11 install uninstall
+.PHONY: build check test test-x11 test-wayland test-wayland-kwin install uninstall
 build:
 	$(CARGO) build --locked --release -p feritto
 check:
@@ -13,6 +13,10 @@ test:
 	$(CARGO) test --workspace --locked
 test-x11:
 	./scripts/check-x11.sh
+test-wayland:
+	./scripts/check-wayland.sh sway
+test-wayland-kwin:
+	./scripts/check-wayland.sh kwin
 install: build
 	install -Dm755 target/release/feritto "$(DESTDIR)$(PREFIX)/bin/feritto"
 	install -Dm644 assets/desktop/io.github.gh2302.Feritto.desktop "$(DESTDIR)$(PREFIX)/share/applications/io.github.gh2302.Feritto.desktop"

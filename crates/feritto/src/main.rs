@@ -2,7 +2,7 @@ mod ipc;
 mod tray;
 use anyhow::{Context, Result, bail};
 use feritto_core::*;
-use feritto_platform::{PlatformEvent, X11Service};
+use feritto_platform::{Backend, Platform, PlatformEvent, PlatformOptions};
 use feritto_store::{Store, private_dir};
 use feritto_ui::{Control, Services};
 use serde::{Deserialize, Serialize};
@@ -32,14 +32,33 @@ pub enum Request {
     ClearHistory,
     ClearClipboard,
 }
+/// The IPC wire message. A launcher or compositor binding may give the CLI process an
+/// xdg-activation token; forwarding it lets the service's popup take focus on Wayland.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope {
+    #[serde(flatten)]
+    pub request: Request,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_token: Option<String>,
+}
 #[derive(Clone)]
 pub struct ContextData {
     store: Store,
-    platform: X11Service,
+    platform: Platform,
     settings: Arc<Mutex<Settings>>,
     controls: crossbeam_channel::Sender<Control>,
 }
 impl ContextData {
+    fn handle_envelope(&self, envelope: Envelope) -> Result<Value> {
+        if matches!(
+            envelope.request,
+            Request::Show | Request::Toggle | Request::Settings
+        ) {
+            self.platform
+                .set_activation_token(envelope.activation_token);
+        }
+        self.handle(envelope.request)
+    }
     fn handle(&self, request: Request) -> Result<Value> {
         match request {
             Request::Status => Ok(
@@ -142,17 +161,24 @@ fn run() -> Result<()> {
     }
     let (request, daemon) = parse_args(&args)?;
     let paths = Paths::new()?;
-    if let Some(response) = ipc::forward(&paths.socket, &request)? {
+    let envelope = Envelope {
+        activation_token: matches!(request, Request::Show | Request::Toggle | Request::Settings)
+            .then(|| std::env::var("XDG_ACTIVATION_TOKEN").ok())
+            .flatten()
+            .filter(|token| !token.is_empty()),
+        request: request.clone(),
+    };
+    if let Some(response) = ipc::forward(&paths.socket, &envelope)? {
         print_response(response)?;
         return Ok(());
     }
     if !matches!(request, Request::Show | Request::Toggle | Request::Settings) && !daemon {
         bail!("feritto is not running; start it with feritto --daemon")
     }
-    feritto_platform::require_x11_session()?;
+    let backend = feritto_platform::detect_session()?;
     let instance = ipc::Instance::claim(&paths.runtime, &paths.socket)?;
     if instance.is_none() {
-        if let Some(response) = ipc::forward(&paths.socket, &request)? {
+        if let Some(response) = ipc::forward(&paths.socket, &envelope)? {
             print_response(response)?;
             return Ok(());
         }
@@ -185,7 +211,12 @@ fn run() -> Result<()> {
     let store = Store::open(paths.data)?;
     let cleanup = settings.clone();
     store.call(move |r| r.cleanup(&cleanup))?;
-    let (platform, events) = X11Service::start(settings.clone())?;
+    let (platform, events) = Platform::start(
+        settings.clone(),
+        PlatformOptions {
+            state_dir: paths.config.clone(),
+        },
+    )?;
     let settings = Arc::new(Mutex::new(settings));
     let (controls, control_rx) = crossbeam_channel::bounded(128);
     let context = ContextData {
@@ -226,7 +257,10 @@ fn run() -> Result<()> {
         controls.send(Control::Settings)?;
     }
     tracing::info!(
-        backend = "X11",
+        backend = match backend {
+            Backend::X11 => "X11",
+            Backend::Wayland => "Wayland",
+        },
         renderer = if cfg!(feature = "wgpu") {
             "wgpu with tiny-skia fallback"
         } else {
@@ -355,6 +389,6 @@ impl Paths {
 }
 fn print_help() {
     println!(
-        "feritto — X11 clipboard history\n\nUsage: feritto [OPTION]\n\n  (no option)          Start or show the popup\n  --daemon             Start with the popup hidden\n  --toggle / --show     Control the popup (default shortcut: Ctrl+grave)\n  --hide / --settings   Hide the popup or open settings\n  --pause              Toggle capture pause\n  --status             Print capabilities and history count as JSON\n  --list [--search Q]   List up to 1000 clip summaries as JSON\n  --copy ID            Put a historical clip on the clipboard\n  --paste ID           Copy and request paste into the active window\n  --add TEXT           Add a text clip to history\n  --add-stdin           Add UTF-8 text from stdin (32 MiB maximum)\n  --delete ID          Delete one history entry\n  --clear-history      Delete all history; keep the current clipboard\n  --clear-clipboard    Clear CLIPBOARD; keep history\n  --quit               Stop the service\n  --help / --version\n\nNative Wayland support is pending. Run in an X11 desktop session."
+        "feritto — clipboard history for X11 and Wayland\n\nUsage: feritto [OPTION]\n\n  (no option)          Start or show the popup\n  --daemon             Start with the popup hidden\n  --toggle / --show     Control the popup (default shortcut: Ctrl+grave)\n                       On Wayland, bind `feritto --toggle` in the compositor if\n                       the desktop has no GlobalShortcuts portal\n  --hide / --settings   Hide the popup or open settings\n  --pause              Toggle capture pause\n  --status             Print capabilities and history count as JSON\n  --list [--search Q]   List up to 1000 clip summaries as JSON\n  --copy ID            Put a historical clip on the clipboard\n  --paste ID           Copy and request paste into the active window\n  --add TEXT           Add a text clip to history\n  --add-stdin           Add UTF-8 text from stdin (32 MiB maximum)\n  --delete ID          Delete one history entry\n  --clear-history      Delete all history; keep the current clipboard\n  --clear-clipboard    Clear CLIPBOARD; keep history\n  --quit               Stop the service\n  --help / --version"
     );
 }

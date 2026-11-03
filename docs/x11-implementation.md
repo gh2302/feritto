@@ -63,6 +63,10 @@ Locally exercised behavior:
 - A held-modifier/focus-change fixture confirms that losing the intended target
   leaves the clipboard ready and reports manual paste, without sending paste
   keys to the unrelated newly focused window.
+- Failure paths keep the worker alive: a SAVE_TARGETS requestor that exits while
+  its source stalls, and TARGETS lists naming unknown atoms, are settled (window
+  released, requestor answered) instead of stopping the service. `TEXT` requests
+  are answered with type `UTF8_STRING` (`x11_robustness` test).
 - Both WMs complete copy → history → case-insensitive literal search → selection
   → paste into the saved xterm target. Shift+Insert explicitly publishes PRIMARY.
   The global hotkey works with CapsLock/NumLock. A PNG is captured, thumbnailed,
@@ -75,8 +79,9 @@ Locally exercised behavior:
   UTF-8 truncation, literal punctuation, alias policy, protected retention, binary
   spill/reload, private permissions, thumbnails, orphan recovery, and refusal of
   a database with a newer schema.
-- The default feature graph contains no `wayland-client` and enables only the
-  declared iced features. `cargo check -p feritto --features wgpu --locked` passes;
+- The X11-only feature graph of this batch contained no `wayland-client`. The Wayland
+  adapter (see [Wayland implementation notes](wayland-implementation.md)) now adds it to
+  the same binary, loaded with dlopen. `cargo check -p feritto --features wgpu --locked` passes;
   GPU rendering has not been runtime-qualified.
 
 The final 100-cycle development-build timing run used event-driven native waits
@@ -122,7 +127,9 @@ yet an X11 beta release. In particular:
   X11 source identity is best effort through the selection owner's WM_CLASS;
   hidden helper windows may have no usable identity. Application exclusions apply
   only when identity is known. Secret hints do not depend on identity.
-- Only the active keyboard group's supported paste keys are injected. A layout
+- Only the active keyboard group's supported paste keys are injected. The group is
+  read over a separate XKB-initialized connection, so the main connection keeps
+  core MappingNotify delivery for hotkey re-registration. A layout
   without a resolvable sequence leaves the clipboard ready for manual paste;
   cross-group Latin shortcut support and per-application profiles are pending.
 - PRIMARY monitoring, configurable hotkey editing, a full-size preview, multi-select,
@@ -140,12 +147,11 @@ yet an X11 beta release. In particular:
   Transfers exceeding limits are incomplete and ineligible for recovery. Queues,
   result snapshots, wire bytes, outgoing requests and decoded image allocation are
   bounded. Large active offers remain alive independently of history deletion.
-- Wayland M7 is explicitly pending. The X11 build refuses native Wayland sessions,
-  including sessions with Xwayland DISPLAY set. No layer-shell runner or portal
-  permission/injection support is claimed from this batch. Add a separate adapter
-  and runner while retaining the shared core/store/UI model and capability states.
+- Wayland is implemented by a separate adapter selected at runtime, sharing the core,
+  store and UI; see [Wayland implementation notes](wayland-implementation.md). The X11
+  adapter still refuses Wayland sessions, including sessions with Xwayland DISPLAY set.
 
 Before declaring the remaining M0 gates complete, also finish the pinned Ditto fixture
-inventory. The layer-shell feasibility spike is explicitly deferred with M7 in this batch;
-record its runner and runtime result when that milestone begins. Passing
+inventory. The layer-shell runner was not adopted; the Wayland notes record the regular-window
+decision and its runtime results. Passing
 these synthetic X11 tests does not substitute for those deliverables.

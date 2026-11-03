@@ -46,7 +46,7 @@ pub fn start(controls: Sender<Control>) {
                 std::thread::park();
             },
             Err(error) => {
-                tracing::info!(%error,"tray unavailable; use Ctrl+grave or feritto --toggle")
+                tracing::info!(%error,"tray unavailable; use the global shortcut or feritto --toggle")
             }
         }
     });

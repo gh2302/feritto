@@ -2,7 +2,7 @@
 
 # feritto
 
-A native X11 clipboard manager inspired by Ditto, written in Rust with iced.
+A native X11 and Wayland clipboard manager inspired by Ditto, written in Rust with iced.
 Capture text, PNG screenshots, HTML, RTF, and file lists; search history and paste
 into the previous application. The desktop service keeps running when its popup
 is hidden. This is the first runnable implementation, not Ditto feature parity.
@@ -23,9 +23,10 @@ Rust 1.90.0, including rustfmt and clippy. `Cargo.lock` pins the dependencies.
 The default renderer is tiny-skia; the optional GPU configuration builds with
 `cargo build --locked -p feritto --features wgpu`.
 
-Run from a **native X11 desktop session**. The X11 build explicitly rejects
-Wayland sessions; a Wayland backend and shell runner are pending. Core types,
-storage, and UI messages are separate from the native adapter to support that port.
+Run it from your desktop session. feritto picks its native backend at runtime: Wayland
+when `WAYLAND_DISPLAY` is set (even if Xwayland also sets `DISPLAY`), otherwise X11.
+One binary supports both; libwayland is loaded at runtime, so there are no extra build
+dependencies. Core types, storage, and the UI are shared by both adapters.
 
 Press **Ctrl+grave** (Ctrl+\`) to toggle the popup. Type to search, use arrow keys
 and PageUp/PageDown to select, then Enter or double-click to paste. Shift+Enter
@@ -42,6 +43,34 @@ qualification; unsupported active layouts use this manual fallback.
 
 A StatusNotifierItem tray appears when the desktop supplies a watcher. If the
 tray is unavailable or the hotkey conflicts, bind `feritto --toggle` in the desktop.
+
+## Wayland
+
+Wayland clipboard managers depend on what the compositor offers to ordinary clients.
+feritto detects each protocol and portal at runtime and shows the result, with reasons,
+under **Settings → Desktop capabilities** and in `feritto --status`.
+
+| Function | Wayland mechanism | Without it |
+|---|---|---|
+| Capture, serve, clear, source-exit recovery, PRIMARY | `ext-data-control-v1`, else `wlr-data-control` | Unavailable (GNOME Shell offers neither) |
+| Global shortcut | GlobalShortcuts portal (Ctrl+\` requested) | Bind `feritto --toggle` in the compositor, e.g. sway: `bindsym Ctrl+grave exec feritto --toggle` |
+| Paste target, focus restore, source app | `wlr-foreign-toplevel-management` | Target not verifiable; exclusions inactive |
+| Automatic paste | `zwp-virtual-keyboard-v1`, else RemoteDesktop portal keyboard (one-time grant in Settings) | Clipboard is set; paste manually |
+| Popup focus | New-window focus; xdg-activation tokens from the launcher, CLI, or portal | Click the popup |
+
+- Keys are only sent once foreign-toplevel confirms the chosen target window is active
+  again. Compositors without it (for example KWin) leave the clipboard ready and ask you to
+  paste, unless you enable **Paste even when the compositor cannot confirm the target
+  window** in Settings.
+- The popup is a regular undecorated window placed by the compositor (sway floats it). It
+  is created when shown and closed when hidden or unfocused; there is no cursor or caret
+  placement. A compositor-bound `feritto --toggle` forwards `XDG_ACTIVATION_TOKEN`.
+- Wayland reports a source exiting and an explicit clear identically. feritto restores the
+  last fully captured clipboard in both cases, except after its own **Clear clipboard**.
+- Hidden-window helpers and command-line copies are attributed to the focused application.
+- Tested on headless sway 1.10 (everything) and KWin 6.3 (clipboard). GNOME Shell lacks
+  data-control, so history cannot be captured there; use an X11 session.
+  See [Wayland implementation notes](docs/wayland-implementation.md).
 
 ```sh
 feritto --daemon                 # start hidden
@@ -106,6 +135,9 @@ make check
 make test
 # Extra test dependencies: xvfb xauth xclip xdotool i3-wm xfwm4 xterm dbus-x11 x11-utils fonts-dejavu-core
 make test-x11
+# Extra test dependencies: sway wl-clipboard wev wtype foot (and kwin-wayland for the KDE run)
+make test-wayland                # headless sway: protocol tests and end-to-end desktop checks
+make test-wayland-kwin           # headless KWin: clipboard protocol tests
 cargo test --release -p feritto-store search_100k -- --ignored --nocapture
 # Five-minute hidden-service measurement, after a release build:
 xvfb-run -a dbus-run-session -- python3 scripts/measure-idle.py
@@ -119,8 +151,8 @@ See [implementation evidence and remaining gates](docs/x11-implementation.md).
 The GTK/Qt/browser/LibreOffice/password-manager matrix, IME, physical multi-monitor
 and DPI behavior, reconnects, accessibility, and GPU runtime qualification remain.
 
-Ditto database import, groups UI, advanced actions, scripting, Friends, and Wayland
-are later milestones. This build does not open or modify a Windows Ditto database.
+Ditto database import, groups UI, advanced actions, scripting, Friends, and a
+layer-shell popup are later milestones. This build does not open or modify a Windows Ditto database.
 New code is an independent implementation under GPL-3.0-or-later; see LICENSE and NOTICE.
 
 ## Design documentation

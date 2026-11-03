@@ -24,12 +24,12 @@ use x11rb::{
 x11rb::atom_manager! {
     Atoms: AtomsCookie {
         CLIPBOARD, CLIPBOARD_MANAGER, TARGETS, TIMESTAMP, MULTIPLE, ATOM_PAIR, INCR, SAVE_TARGETS,
-        UTF8_STRING, STRING, INTEGER, ATOM,
-        _NET_ACTIVE_WINDOW, _NET_WM_WINDOW_TYPE, _NET_WM_WINDOW_TYPE_UTILITY,
+        UTF8_STRING, STRING, TEXT, INTEGER, ATOM,
+        _NET_ACTIVE_WINDOW, _NET_SUPPORTING_WM_CHECK, _NET_FRAME_EXTENTS, _NET_WM_WINDOW_TYPE, _NET_WM_WINDOW_TYPE_UTILITY,
         _NET_WM_STATE, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER, _NET_WM_STATE_ABOVE,
         _NET_WM_USER_TIME, _NET_WM_NAME, _NET_WM_PID, _NET_CURRENT_DESKTOP, _NET_WORKAREA,
         WM_CLASS, WM_TRANSIENT_FOR,
-        _FERITTO_TIME,
+        _FERITTO_TIME, _FERITTO_CAPTURE, _FERITTO_HANDOFF,
         KDE_SECRET: b"x-kde-passwordManagerHint",
         IGNORE: b"application/x-feritto-ignore",
         VIEWER_IGNORE: b"Clipboard Viewer Ignore",
@@ -193,7 +193,7 @@ struct Published {
 struct Outgoing {
     requestor: Window,
     property: Atom,
-    target: Atom,
+    type_: Atom,
     bytes: Arc<[u8]>,
     offset: usize,
     progress: Instant,
@@ -206,8 +206,9 @@ struct Incoming {
     window: Window,
     property: Atom,
     target: Atom,
+    target_name: String,
     stage: Stage,
-    queue: VecDeque<Atom>,
+    queue: VecDeque<(Atom, String)>,
     representations: Vec<Representation>,
     omitted: Vec<String>,
     bytes: Vec<u8>,
@@ -216,6 +217,13 @@ struct Incoming {
     progress: Instant,
     secret: bool,
     save: Option<SelectionRequestEvent>,
+}
+/// What a capture step decided. The caller settles the capture so every exit path,
+/// including errors, releases the transfer window and answers a pending SAVE_TARGETS.
+enum Step {
+    Continue,
+    Drop,
+    Finish,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -237,6 +245,11 @@ struct PendingPaste {
 
 struct Worker {
     conn: RustConnection,
+    /// XKB-initialized connection used only to read the keyboard group. XkbUseExtension changes
+    /// core MappingNotify delivery, which the main connection needs for hotkey re-registration.
+    xkb: Option<RustConnection>,
+    /// Events read while waiting for a specific reply; handled in order by the main loop.
+    deferred: VecDeque<Event>,
     root: Window,
     window: Window,
     atoms: Atoms,
@@ -326,8 +339,15 @@ impl Worker {
         };
         let owner = conn.get_selection_owner(atoms.CLIPBOARD)?.reply()?.owner;
         let chunk_size = (conn.maximum_request_bytes().saturating_sub(128)).min(64 * 1024);
+        let xkb = x11rb::connect(None).ok().and_then(|(xkb, _)| {
+            use x11rb::protocol::xkb::ConnectionExt as _;
+            let supported = xkb.xkb_use_extension(1, 0).ok()?.reply().ok()?.supported;
+            supported.then_some(xkb)
+        });
         let mut worker = Self {
             conn,
+            xkb,
+            deferred: VecDeque::new(),
             root,
             window,
             atoms,
@@ -370,26 +390,58 @@ impl Worker {
             *shared.lock().unwrap() = self.capabilities.clone();
         }
     }
-    fn atom(&self, name: &str) -> Result<Atom> {
-        Ok(self.conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+    /// Interns several atoms with one round trip.
+    fn atoms_for<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Result<Vec<Atom>> {
+        let cookies = names
+            .into_iter()
+            .map(|name| self.conn.intern_atom(false, name.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        cookies
+            .into_iter()
+            .map(|cookie| Ok(cookie.reply()?.atom))
+            .collect()
     }
-    fn name(&self, atom: Atom) -> Result<String> {
-        Ok(String::from_utf8_lossy(&self.conn.get_atom_name(atom)?.reply()?.name).into_owned())
+    /// Names atoms with one round trip; atoms the server does not know are skipped.
+    fn names(&self, atoms: &[Atom]) -> Result<Vec<(Atom, String)>> {
+        let cookies = atoms
+            .iter()
+            .map(|&atom| self.conn.get_atom_name(atom).map(|c| (atom, c)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(cookies
+            .into_iter()
+            .filter_map(|(atom, cookie)| {
+                let name = cookie.reply().ok()?.name;
+                Some((atom, String::from_utf8_lossy(&name).into_owned()))
+            })
+            .collect())
+    }
+    fn next_event(&mut self) -> Result<Option<Event>> {
+        if let Some(event) = self.deferred.pop_front() {
+            return Ok(Some(event));
+        }
+        Ok(self.conn.poll_for_event()?)
+    }
+    /// A failure handling one event is reported and never stops the worker.
+    fn handle(&mut self, event: Event) {
+        if let Err(error) = self.event(event) {
+            self.report(error);
+        }
+    }
+    fn report(&self, error: anyhow::Error) {
+        tracing::warn!(%error, "X11 operation failed");
+        self.emit(PlatformEvent::Status(format!(
+            "X11 operation failed: {error}"
+        )));
     }
     fn run(&mut self, rx: Receiver<Command>, wake: UnixDatagram) -> Result<()> {
         loop {
             let mut event_count = 0;
-            for _ in 0..256 {
-                let Some(event) = self.conn.poll_for_event()? else {
+            while event_count < 256 {
+                let Some(event) = self.next_event()? else {
                     break;
                 };
                 event_count += 1;
-                if let Err(error) = self.event(event) {
-                    tracing::warn!(%error,"X11 operation failed");
-                    self.emit(PlatformEvent::Status(format!(
-                        "X11 operation failed: {error}"
-                    )));
-                }
+                self.handle(event);
             }
             let mut command_count = 0;
             for _ in 0..64 {
@@ -407,19 +459,17 @@ impl Worker {
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                 }
             }
-            self.timeouts()?;
+            // Only a broken connection is fatal; it also fails the flush below.
+            if let Err(error) = self.timeouts() {
+                self.report(error);
+            }
             self.conn.flush()?;
-            if event_count == 256 || command_count > 0 {
+            if event_count == 256 || command_count > 0 || !self.deferred.is_empty() {
                 continue;
             }
             // Reply round trips can buffer events inside x11rb even when the socket is no longer readable.
             if let Some(event) = self.conn.poll_for_event()? {
-                if let Err(error) = self.event(event) {
-                    tracing::warn!(%error,"X11 operation failed");
-                    self.emit(PlatformEvent::Status(format!(
-                        "X11 operation failed: {error}"
-                    )));
-                }
+                self.handle(event);
                 continue;
             }
             // Sleep on both native events and commands. Idle timeouts only detect a dropped handle;
@@ -532,12 +582,22 @@ impl Worker {
             }
             Command::FocusPopup(window) => {
                 self.popup = window;
-                // The WM publishes frame extents only after the first map. Clamp the managed frame before activation.
-                let _ = self.prepare(window, 0, 0);
-                let _ = self.request_focus(window, self.timestamp);
+                // The WM publishes frame extents only after the first map. Clamp the managed frame
+                // before activation; window type and state now belong to the WM and stay untouched.
+                if let Err(error) = self.place_popup(window, 0, 0) {
+                    tracing::debug!(%error, "popup placement after map failed");
+                }
+                // A fresh timestamp: the stored one may predate the WM's last user interaction.
+                let time = self.server_time().unwrap_or(self.timestamp);
+                if let Err(error) = self.request_focus(window, time) {
+                    tracing::debug!(%error, "popup focus request failed");
+                }
             }
             Command::Restore(target) => {
-                let _ = self.request_focus(target.window, target.timestamp);
+                let time = self.server_time().unwrap_or(target.timestamp);
+                if let Err(error) = self.request_focus(target.window, time) {
+                    tracing::debug!(%error, "focus restoration failed");
+                }
             }
             Command::Shutdown(_) => {}
         }
@@ -549,6 +609,16 @@ impl Worker {
             }
             Event::SelectionNotify(e) => self.selection_notify(e)?,
             Event::SelectionRequest(e) => self.serve(e)?,
+            // Release a large PRIMARY offer once another client owns PRIMARY. The owner check
+            // ignores a stale clear that arrives after a newer explicit PRIMARY publication.
+            Event::SelectionClear(e)
+                if e.selection == u32::from(AtomEnum::PRIMARY)
+                    && self.conn.get_selection_owner(e.selection)?.reply()?.owner
+                        != self.window =>
+            {
+                self.primary_published = None;
+            }
+            Event::DestroyNotify(e) => self.outgoing.retain(|o| o.requestor != e.window),
             Event::SelectionClear(e) if e.selection == self.atoms.CLIPBOARD_MANAGER => {
                 self.manager = false;
                 self.capabilities.persistence =
@@ -597,6 +667,8 @@ impl Worker {
                 && saved.generation == self.generation
                 && saved.owner == previous
             {
+                // Prepare the served data first so a claimed CLIPBOARD never lacks an offer.
+                let published = self.build_published(&saved.offer, e.timestamp)?;
                 // A server grab makes the owner check + timestamped claim atomic against a new copy.
                 self.conn.grab_server()?.check()?;
                 let claim = (|| -> Result<bool> {
@@ -623,7 +695,7 @@ impl Worker {
                         .owner
                         == self.window
                 {
-                    self.install_offer(&saved.offer, e.timestamp)?;
+                    self.published = Some(published);
                     self.owner = self.window;
                 }
             }
@@ -675,10 +747,7 @@ impl Worker {
     }
     fn cancel_incoming(&mut self) {
         if let Some(incoming) = self.incoming.take() {
-            let _ = self.conn.destroy_window(incoming.window);
-            if let Some(save) = incoming.save {
-                let _ = self.notify(save, NONE);
-            }
+            self.drop_capture(incoming);
         }
     }
     fn source(&self, owner: Window) -> SourceIdentity {
@@ -705,59 +774,38 @@ impl Worker {
         timestamp: u32,
         save: Option<SelectionRequestEvent>,
     ) -> Result<()> {
-        if self.settings.paused {
-            if let Some(save) = save {
-                self.notify(save, NONE)?;
-            }
-            return Ok(());
-        }
         let source = self.source(owner);
-        if source.application.as_ref().is_some_and(|app| {
+        let excluded = source.application.as_ref().is_some_and(|app| {
             self.settings
                 .capture
                 .excluded_applications
                 .iter()
                 .any(|excluded| app.eq_ignore_ascii_case(excluded))
-        }) {
+        });
+        if self.settings.paused || excluded {
             if let Some(save) = save {
-                self.notify(save, NONE)?;
+                self.notify(save, NONE);
             }
             return Ok(());
         }
-        let window = self.conn.generate_id()?;
-        self.conn
-            .create_window(
-                COPY_DEPTH_FROM_PARENT,
-                window,
-                self.root,
-                0,
-                0,
-                1,
-                1,
-                0,
-                WindowClass::INPUT_OUTPUT,
-                0,
-                &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-            )?
-            .check()?;
-        let property = self.atom("_FERITTO_CAPTURE")?;
-        self.conn
-            .convert_selection(
-                window,
-                self.atoms.CLIPBOARD,
-                self.atoms.TARGETS,
-                property,
-                timestamp,
-            )?
-            .check()?;
-        self.incoming = Some(Incoming {
+        let window = match self.conn.generate_id() {
+            Ok(window) => window,
+            Err(error) => {
+                if let Some(save) = save {
+                    self.notify(save, NONE);
+                }
+                return Err(error.into());
+            }
+        };
+        let input = Incoming {
             generation: self.generation,
             owner,
             timestamp,
             source,
             window,
-            property,
+            property: self.atoms._FERITTO_CAPTURE,
             target: self.atoms.TARGETS,
+            target_name: "TARGETS".into(),
             stage: Stage::Targets,
             queue: VecDeque::new(),
             representations: vec![],
@@ -768,20 +816,68 @@ impl Worker {
             progress: Instant::now(),
             secret: false,
             save,
-        });
-        Ok(())
+        };
+        let step = (|| -> Result<Step> {
+            self.conn
+                .create_window(
+                    COPY_DEPTH_FROM_PARENT,
+                    window,
+                    self.root,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    0,
+                    &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+                )?
+                .check()?;
+            self.conn
+                .convert_selection(
+                    window,
+                    self.atoms.CLIPBOARD,
+                    self.atoms.TARGETS,
+                    input.property,
+                    timestamp,
+                )?
+                .check()?;
+            Ok(Step::Continue)
+        })();
+        self.settle(input, step)
+    }
+    /// Applies a capture step. Errors drop the capture so its window is destroyed and a
+    /// SAVE_TARGETS requestor is answered instead of waiting for its own timeout.
+    fn settle(&mut self, input: Incoming, step: Result<Step>) -> Result<()> {
+        match step {
+            Ok(Step::Continue) => {
+                self.incoming = Some(input);
+                Ok(())
+            }
+            Ok(Step::Drop) => {
+                self.drop_capture(input);
+                Ok(())
+            }
+            Ok(Step::Finish) => self.finish_capture(input),
+            Err(error) => {
+                self.drop_capture(input);
+                Err(error)
+            }
+        }
     }
     fn selection_notify(&mut self, e: SelectionNotifyEvent) -> Result<()> {
-        let Some(mut input) = self.incoming.take() else {
-            return Ok(());
-        };
-        if e.requestor != input.window
-            || e.selection != self.atoms.CLIPBOARD
-            || e.target != input.target
-        {
-            self.incoming = Some(input);
+        if !self.incoming.as_ref().is_some_and(|input| {
+            e.requestor == input.window
+                && e.selection == self.atoms.CLIPBOARD
+                && e.target == input.target
+        }) {
             return Ok(());
         }
+        let mut input = self.incoming.take().unwrap();
+        let step = self.selection_step(&mut input, e);
+        self.settle(input, step)
+    }
+    fn selection_step(&mut self, input: &mut Incoming, e: SelectionNotifyEvent) -> Result<Step> {
         if self
             .conn
             .get_selection_owner(self.atoms.CLIPBOARD)?
@@ -789,17 +885,14 @@ impl Worker {
             .owner
             != input.owner
         {
-            self.drop_capture(input);
-            return Ok(());
+            return Ok(Step::Drop);
         }
         if e.property == NONE {
-            input.omitted.push(self.name(input.target)?);
             if input.stage == Stage::Targets || input.stage == Stage::Secret {
-                self.drop_capture(input);
-                return Ok(());
+                return Ok(Step::Drop);
             }
-            self.next_target(input)?;
-            return Ok(());
+            input.omitted.push(input.target_name.clone());
+            return self.next_target(input);
         }
         let reply = self
             .conn
@@ -809,36 +902,35 @@ impl Worker {
                 input.property,
                 AtomEnum::ANY,
                 0,
-                if input.stage == Stage::Targets {
-                    4097
-                } else if input.stage == Stage::Secret {
-                    17
-                } else {
-                    (self.settings.capture.max_target_bytes / 4 + 1) as u32
+                match input.stage {
+                    Stage::Targets => 4097,
+                    Stage::Secret => 17,
+                    _ => (self.settings.capture.max_target_bytes / 4 + 1) as u32,
                 },
             )?
             .reply()?;
         input.progress = Instant::now();
         if input.stage == Stage::Targets {
-            if reply.type_ != self.atoms.ATOM || reply.format != 32 || reply.bytes_after != 0 {
-                self.drop_capture(input);
-                return Ok(());
+            // ICCCM specifies type ATOM; some older owners label the list TARGETS.
+            if (reply.type_ != self.atoms.ATOM && reply.type_ != self.atoms.TARGETS)
+                || reply.format != 32
+                || reply.bytes_after != 0
+            {
+                return Ok(Step::Drop);
             }
-            let targets: Vec<Atom> = reply.value32().into_iter().flatten().take(4096).collect();
-            if targets.len() > 4096 {
-                self.drop_capture(input);
-                return Ok(());
+            let targets: Vec<Atom> = reply.value32().into_iter().flatten().collect();
+            if targets.len() > 4096
+                || targets.contains(&self.atoms.IGNORE)
+                || targets.contains(&self.atoms.VIEWER_IGNORE)
+            {
+                return Ok(Step::Drop);
             }
-            let mut names = Vec::new();
-            for &atom in &targets {
-                names.push(self.name(atom)?);
-            }
-            if targets.contains(&self.atoms.IGNORE) || targets.contains(&self.atoms.VIEWER_IGNORE) {
-                self.drop_capture(input);
-                return Ok(());
-            }
+            let named = self.names(&targets)?;
+            let names: Vec<String> = named.iter().map(|(_, name)| name.clone()).collect();
             for name in self.settings.capture.select_targets(&names) {
-                input.queue.push_back(self.atom(&name)?);
+                if let Some(&(atom, _)) = named.iter().find(|(_, n)| *n == name) {
+                    input.queue.push_back((atom, name));
+                }
             }
             if let Some(save) = input.save
                 && save.property != NONE
@@ -857,12 +949,13 @@ impl Worker {
                 if let Some(atoms) = requested.value32() {
                     let requested: Vec<_> = atoms.collect();
                     if !requested.is_empty() {
-                        input.queue.retain(|atom| requested.contains(atom));
+                        input.queue.retain(|(atom, _)| requested.contains(atom));
                     }
                 }
             }
             if targets.contains(&self.atoms.KDE_SECRET) {
                 input.target = self.atoms.KDE_SECRET;
+                input.target_name = "x-kde-passwordManagerHint".into();
                 input.stage = Stage::Secret;
                 self.conn
                     .convert_selection(
@@ -873,60 +966,66 @@ impl Worker {
                         input.timestamp,
                     )?
                     .check()?;
-                self.incoming = Some(input);
-            } else {
-                self.next_target(input)?;
+                return Ok(Step::Continue);
             }
-        } else if reply.type_ == self.atoms.INCR {
+            return self.next_target(input);
+        }
+        if reply.type_ == self.atoms.INCR {
+            if input.stage == Stage::Secret {
+                return Ok(Step::Drop);
+            }
             let announced = reply.value32().and_then(|mut v| v.next()).unwrap_or(0) as usize;
-            if input.stage == Stage::Secret
-                || announced > self.settings.capture.max_target_bytes
+            if announced > self.settings.capture.max_target_bytes
                 || announced.saturating_add(input.total)
                     > self.settings.capture.max_generation_bytes
             {
-                input.omitted.push(self.name(input.target)?);
-                self.finish_capture(input)?;
-            } else {
-                input.stage = Stage::Incremental;
-                input.bytes.clear();
-                self.incoming = Some(input);
+                // The owner already started the transfer on our property; stop here instead of
+                // letting its chunks collide with the next target.
+                input.omitted.push(input.target_name.clone());
+                return Ok(Step::Finish);
             }
-        } else if input.stage == Stage::Secret {
+            input.stage = Stage::Incremental;
+            input.bytes.clear();
+            return Ok(Step::Continue);
+        }
+        if input.stage == Stage::Secret {
             input.secret = reply.bytes_after != 0
                 || reply.value.len() > 64
                 || String::from_utf8_lossy(&reply.value)
                     .trim_end_matches('\0')
                     .trim()
                     .eq_ignore_ascii_case("secret");
-            if input.secret {
-                self.drop_capture(input);
+            return if input.secret {
+                Ok(Step::Drop)
             } else {
-                self.next_target(input)?;
-            }
-        } else {
-            if reply.bytes_after != 0
-                || reply.value.len() > self.settings.capture.max_target_bytes
-                || input.total.saturating_add(reply.value.len())
-                    > self.settings.capture.max_generation_bytes
-                || reply.format != 8
-            {
-                input.omitted.push(self.name(input.target)?);
-            } else {
-                self.add_representation(&mut input, reply.value)?;
-            }
-            self.next_target(input)?;
+                self.next_target(input)
+            };
         }
-        Ok(())
+        if reply.bytes_after != 0
+            || reply.value.len() > self.settings.capture.max_target_bytes
+            || input.total.saturating_add(reply.value.len())
+                > self.settings.capture.max_generation_bytes
+            || reply.format != 8
+        {
+            input.omitted.push(input.target_name.clone());
+        } else {
+            Self::add_representation(input, reply.value);
+        }
+        self.next_target(input)
     }
     fn incoming_chunk(&mut self, e: PropertyNotifyEvent) -> Result<()> {
-        let Some(input) = &self.incoming else {
-            return Ok(());
-        };
-        if input.stage != Stage::Incremental || e.window != input.window || e.atom != input.property
-        {
+        if !self.incoming.as_ref().is_some_and(|input| {
+            input.stage == Stage::Incremental
+                && e.window == input.window
+                && e.atom == input.property
+        }) {
             return Ok(());
         }
         let mut input = self.incoming.take().unwrap();
+        let step = self.chunk_step(&mut input);
+        self.settle(input, step)
+    }
+    fn chunk_step(&mut self, input: &mut Incoming) -> Result<Step> {
         if self
             .conn
             .get_selection_owner(self.atoms.CLIPBOARD)?
@@ -934,8 +1033,7 @@ impl Worker {
             .owner
             != input.owner
         {
-            self.drop_capture(input);
-            return Ok(());
+            return Ok(Step::Drop);
         }
         let reply = self
             .conn
@@ -950,8 +1048,7 @@ impl Worker {
             .reply()?;
         // Ignore the stale PropertyNotify for the INCR header already consumed above.
         if reply.type_ == NONE {
-            self.incoming = Some(input);
-            return Ok(());
+            return Ok(Step::Continue);
         }
         input.progress = Instant::now();
         if reply.bytes_after != 0
@@ -964,20 +1061,19 @@ impl Worker {
                 .saturating_add(reply.value.len())
                 > self.settings.capture.max_generation_bytes
         {
-            input.omitted.push(self.name(input.target)?);
-            self.finish_capture(input)?;
+            input.omitted.push(input.target_name.clone());
+            Ok(Step::Finish)
         } else if reply.value.is_empty() {
             let bytes = std::mem::take(&mut input.bytes);
-            self.add_representation(&mut input, bytes)?;
-            self.next_target(input)?;
+            Self::add_representation(input, bytes);
+            self.next_target(input)
         } else {
             input.bytes.extend(reply.value);
-            self.incoming = Some(input);
+            Ok(Step::Continue)
         }
-        Ok(())
     }
-    fn add_representation(&self, input: &mut Incoming, bytes: Vec<u8>) -> Result<()> {
-        let target = self.name(input.target)?;
+    fn add_representation(input: &mut Incoming, bytes: Vec<u8>) {
+        let target = input.target_name.clone();
         let mime = if is_text(&target) {
             Some("text/plain;charset=utf-8".into())
         } else if target.contains('/') {
@@ -991,42 +1087,52 @@ impl Worker {
             mime,
             bytes: Arc::from(bytes),
         });
-        Ok(())
     }
-    fn next_target(&mut self, mut input: Incoming) -> Result<()> {
-        if let Some(target) = input.queue.pop_front() {
-            input.target = target;
-            input.stage = Stage::Data;
-            input.bytes.clear();
-            input.progress = Instant::now();
-            self.conn
-                .convert_selection(
-                    input.window,
-                    self.atoms.CLIPBOARD,
-                    target,
-                    input.property,
-                    input.timestamp,
-                )?
-                .check()?;
-            self.incoming = Some(input);
-            Ok(())
-        } else {
-            self.finish_capture(input)
-        }
+    fn next_target(&mut self, input: &mut Incoming) -> Result<Step> {
+        let Some((target, name)) = input.queue.pop_front() else {
+            return Ok(Step::Finish);
+        };
+        input.target = target;
+        input.target_name = name;
+        input.stage = Stage::Data;
+        input.bytes.clear();
+        input.progress = Instant::now();
+        self.conn
+            .convert_selection(
+                input.window,
+                self.atoms.CLIPBOARD,
+                target,
+                input.property,
+                input.timestamp,
+            )?
+            .check()?;
+        Ok(Step::Continue)
     }
     fn drop_capture(&self, input: Incoming) {
         let _ = self.conn.destroy_window(input.window);
         if let Some(save) = input.save {
-            let _ = self.notify(save, NONE);
+            self.notify(save, NONE);
         }
     }
-    fn finish_capture(&mut self, input: Incoming) -> Result<()> {
+    fn finish_capture(&mut self, mut input: Incoming) -> Result<()> {
         let _ = self.conn.destroy_window(input.window);
+        let save = input.save.take();
+        let result = self.store_capture(input, save.as_ref());
+        // Answer SAVE_TARGETS on every path; NONE reports failure to the requestor.
+        if let Some(save) = save {
+            self.notify(save, *result.as_ref().unwrap_or(&NONE));
+        }
+        result.map(|_| ())
+    }
+    /// Emits a finished capture and completes SAVE_TARGETS. Returns the property that holds the
+    /// saved target list, or NONE when nothing was saved for the requestor.
+    fn store_capture(
+        &mut self,
+        input: Incoming,
+        save: Option<&SelectionRequestEvent>,
+    ) -> Result<Atom> {
         if input.representations.is_empty() {
-            if let Some(save) = input.save {
-                self.notify(save, NONE)?;
-            }
-            return Ok(());
+            return Ok(NONE);
         }
         let complete = input.omitted.is_empty() && input.queue.is_empty();
         let offer = Arc::new(Offer {
@@ -1038,10 +1144,7 @@ impl Worker {
             .reply()?
             .owner;
         if input.generation != self.generation || owner != input.owner {
-            if let Some(save) = input.save {
-                self.notify(save, NONE)?;
-            }
-            return Ok(());
+            return Ok(NONE);
         }
         if complete {
             self.saved = Some(Saved {
@@ -1050,34 +1153,10 @@ impl Worker {
                 offer: offer.clone(),
             });
         }
-        if let Some(save) = input.save {
-            if complete {
-                self.publish(&offer, false)?;
-                let targets: Vec<_> = offer
-                    .representations
-                    .iter()
-                    .filter_map(|r| self.atom(&r.target).ok())
-                    .collect();
-                let property = if save.property == NONE {
-                    save.target
-                } else {
-                    save.property
-                };
-                self.conn.change_property32(
-                    PropMode::REPLACE,
-                    save.requestor,
-                    property,
-                    self.atoms.ATOM,
-                    &targets,
-                )?;
-                self.notify(save, property)?;
-            } else {
-                self.notify(save, NONE)?;
-            }
-        }
+        // History receives the copy even if taking over the selection fails below.
         self.emit(PlatformEvent::Captured(Capture {
             generation: input.generation,
-            offer,
+            offer: offer.clone(),
             source: input.source,
             complete,
             omitted: input.omitted,
@@ -1088,8 +1167,27 @@ impl Worker {
                     .into(),
             ));
         }
-        Ok(())
+        let Some(save) = save.filter(|_| complete) else {
+            return Ok(NONE);
+        };
+        self.publish(&offer, false)?;
+        let targets = self.atoms_for(offer.representations.iter().map(|r| r.target.as_str()))?;
+        let property = if save.property == NONE {
+            save.target
+        } else {
+            save.property
+        };
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            save.requestor,
+            property,
+            self.atoms.ATOM,
+            &targets,
+        )?;
+        Ok(property)
     }
+    /// Reads the server time through a property change. Unrelated events that arrive first are
+    /// deferred to the main loop, so callers never re-enter event handling.
     fn server_time(&mut self) -> Result<u32> {
         self.conn.change_property8(
             PropMode::REPLACE,
@@ -1108,26 +1206,36 @@ impl Worker {
                 self.timestamp = e.time;
                 return Ok(e.time);
             }
-            self.event(event)?;
+            self.deferred.push_back(event);
         }
     }
-    fn install_offer(&mut self, offer: &Offer, timestamp: u32) -> Result<()> {
+    fn build_published(&self, offer: &Offer, timestamp: u32) -> Result<Published> {
+        const TEXT_TARGETS: [&str; 5] = [
+            "UTF8_STRING",
+            "text/plain;charset=utf-8",
+            "text/plain;charset=UTF-8",
+            "text/plain",
+            "TEXT",
+        ];
+        let originals: Vec<_> = offer
+            .representations
+            .iter()
+            .filter(|r| !is_protocol_target(&r.target))
+            .collect();
+        let atoms = self.atoms_for(
+            originals
+                .iter()
+                .map(|r| r.target.as_str())
+                .chain(TEXT_TARGETS),
+        )?;
         let mut data = HashMap::new();
-        for r in &offer.representations {
-            if !is_protocol_target(&r.target) {
-                data.insert(self.atom(&r.target)?, r.bytes.clone());
-            }
+        for (r, &atom) in originals.iter().zip(&atoms) {
+            data.insert(atom, r.bytes.clone());
         }
         if let Some(text) = offer.text_content() {
             let utf8: Arc<[u8]> = Arc::from(text.as_bytes());
-            for target in [
-                "UTF8_STRING",
-                "text/plain;charset=utf-8",
-                "text/plain;charset=UTF-8",
-                "text/plain",
-                "TEXT",
-            ] {
-                data.insert(self.atom(target)?, utf8.clone());
+            for &atom in &atoms[originals.len()..] {
+                data.insert(atom, utf8.clone());
             }
             if text.chars().all(|c| u32::from(c) <= 255) {
                 data.insert(
@@ -1139,20 +1247,20 @@ impl Worker {
         if data.is_empty() {
             bail!("no supported formats in clipboard offer")
         }
-        self.published = Some(Published { data, timestamp });
-        Ok(())
+        Ok(Published { data, timestamp })
     }
     fn publish(&mut self, offer: &Offer, primary: bool) -> Result<()> {
         let timestamp = self.server_time()?;
-        self.install_offer(offer, timestamp)?;
+        let published = self.build_published(offer, timestamp)?;
         self.conn
             .set_selection_owner(self.window, self.atoms.CLIPBOARD, timestamp)?
             .check()?;
+        self.published = Some(published.clone());
         if primary {
-            self.primary_published = self.published.clone();
             self.conn
                 .set_selection_owner(self.window, AtomEnum::PRIMARY.into(), timestamp)?
                 .check()?;
+            self.primary_published = Some(published);
         }
         if self
             .conn
@@ -1168,24 +1276,26 @@ impl Worker {
         self.cancel_incoming();
         Ok(())
     }
-    fn notify(&self, request: SelectionRequestEvent, property: Atom) -> Result<()> {
-        self.conn
-            .send_event(
-                false,
-                request.requestor,
-                EventMask::NO_EVENT,
-                SelectionNotifyEvent {
-                    response_type: SELECTION_NOTIFY_EVENT,
-                    sequence: 0,
-                    time: request.time,
-                    requestor: request.requestor,
-                    selection: request.selection,
-                    target: request.target,
-                    property,
-                },
-            )?
-            .check()?;
-        Ok(())
+    /// Answers a selection request without waiting. The requestor may already be gone (an exiting
+    /// SAVE_TARGETS client, a killed paste target); that BadWindow is only an asynchronous error.
+    fn notify(&self, request: SelectionRequestEvent, property: Atom) {
+        let sent = self.conn.send_event(
+            false,
+            request.requestor,
+            EventMask::NO_EVENT,
+            SelectionNotifyEvent {
+                response_type: SELECTION_NOTIFY_EVENT,
+                sequence: 0,
+                time: request.time,
+                requestor: request.requestor,
+                selection: request.selection,
+                target: request.target,
+                property,
+            },
+        );
+        if let Err(error) = sent {
+            tracing::debug!(%error, "could not answer a selection request");
+        }
     }
     fn serve(&mut self, e: SelectionRequestEvent) -> Result<()> {
         if e.selection == self.atoms.CLIPBOARD_MANAGER
@@ -1198,19 +1308,20 @@ impl Worker {
                 .reply()?
                 .owner;
             if owner == NONE || owner == self.window {
-                self.notify(e, NONE)?;
+                self.notify(e, NONE);
             } else {
                 self.cancel_incoming();
+                // begin_capture answers the requestor itself, including on failure.
                 self.begin_capture(owner, e.time, Some(e))?;
             }
             return Ok(());
         }
         if e.selection != self.atoms.CLIPBOARD && e.selection != u32::from(AtomEnum::PRIMARY) {
-            self.notify(e, NONE)?;
+            self.notify(e, NONE);
             return Ok(());
         }
         if self.conn.get_selection_owner(e.selection)?.reply()?.owner != self.window {
-            self.notify(e, NONE)?;
+            self.notify(e, NONE);
             return Ok(());
         }
         let offer = if e.selection == u32::from(AtomEnum::PRIMARY) {
@@ -1219,11 +1330,11 @@ impl Worker {
             &self.published
         };
         let Some(published) = offer.clone() else {
-            self.notify(e, NONE)?;
+            self.notify(e, NONE);
             return Ok(());
         };
         if e.time != CURRENT_TIME && (e.time.wrapping_sub(published.timestamp) as i32) < 0 {
-            self.notify(e, NONE)?;
+            self.notify(e, NONE);
             return Ok(());
         }
         let property = if e.property == NONE {
@@ -1233,7 +1344,7 @@ impl Worker {
         };
         if e.target == self.atoms.MULTIPLE {
             if e.property == NONE {
-                self.notify(e, NONE)?;
+                self.notify(e, NONE);
                 return Ok(());
             }
             let reply = self
@@ -1244,12 +1355,12 @@ impl Worker {
                 || reply.bytes_after != 0
                 || (reply.type_ != self.atoms.ATOM_PAIR && reply.type_ != self.atoms.ATOM)
             {
-                self.notify(e, NONE)?;
+                self.notify(e, NONE);
                 return Ok(());
             }
             let mut pairs: Vec<_> = reply.value32().into_iter().flatten().collect();
             if pairs.len() % 2 != 0 {
-                self.notify(e, NONE)?;
+                self.notify(e, NONE);
                 return Ok(());
             }
             let mut used = Vec::new();
@@ -1272,10 +1383,10 @@ impl Worker {
                 self.atoms.ATOM_PAIR,
                 &pairs,
             )?;
-            self.notify(e, property)?;
+            self.notify(e, property);
         } else {
             let ok = self.convert(e.requestor, e.target, property, &published)?;
-            self.notify(e, if ok { property } else { NONE })?;
+            self.notify(e, if ok { property } else { NONE });
         }
         Ok(())
     }
@@ -1311,14 +1422,15 @@ impl Worker {
                 &[published.timestamp],
             )?;
         } else if let Some(bytes) = published.data.get(&target) {
+            // TEXT asks for any text encoding; ICCCM requires the reply to name the actual one.
+            let type_ = if target == self.atoms.TEXT {
+                self.atoms.UTF8_STRING
+            } else {
+                target
+            };
             if bytes.len() <= self.chunk_size {
-                self.conn.change_property8(
-                    PropMode::REPLACE,
-                    requestor,
-                    property,
-                    target,
-                    bytes,
-                )?;
+                self.conn
+                    .change_property8(PropMode::REPLACE, requestor, property, type_, bytes)?;
             } else {
                 if self.outgoing.len() >= 32
                     || self
@@ -1345,7 +1457,7 @@ impl Worker {
                 self.outgoing.push(Outgoing {
                     requestor,
                     property,
-                    target,
+                    type_,
                     bytes: bytes.clone(),
                     offset: 0,
                     progress: Instant::now(),
@@ -1370,16 +1482,26 @@ impl Worker {
             PropMode::REPLACE,
             requestor,
             property,
-            output.target,
+            output.type_,
             &output.bytes[output.offset..end],
         )?;
         output.progress = Instant::now();
         if output.offset == output.bytes.len() {
             self.outgoing.swap_remove(index);
+            self.release_requestor(requestor);
         } else {
             output.offset = end;
         }
         Ok(())
+    }
+    /// Stops watching a foreign window once none of its INCR transfers remain.
+    fn release_requestor(&self, requestor: Window) {
+        if !self.outgoing.iter().any(|o| o.requestor == requestor) {
+            let _ = self.conn.change_window_attributes(
+                requestor,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+            );
+        }
     }
     fn register_hotkey(&mut self) {
         if let Some((code, mods)) = self.hotkey.take() {
@@ -1391,10 +1513,11 @@ impl Worker {
             let min = self.conn.setup().min_keycode;
             let count = self.conn.setup().max_keycode - min + 1;
             let mapping = self.conn.get_keyboard_mapping(min, count)?.reply()?;
-            let code = mapping
-                .keysyms
-                .chunks(mapping.keysyms_per_keycode as usize)
-                .position(|syms| syms.contains(&0x60))
+            let keys = || mapping.keysyms.chunks(mapping.keysyms_per_keycode as usize);
+            // Prefer the key whose base symbol is grave over one that produces it with a modifier.
+            let code = keys()
+                .position(|syms| syms.first() == Some(&0x60))
+                .or_else(|| keys().position(|syms| syms.contains(&0x60)))
                 .map(|i| min + i as u8)
                 .context("grave key is absent from the keyboard map")?;
             let modifiers = self.conn.get_modifier_mapping()?.reply()?;
@@ -1479,19 +1602,19 @@ impl Worker {
             timestamp: self.timestamp,
         })
     }
+    /// Prepares the hidden popup before it is mapped: window hints, then placement.
     fn prepare(&mut self, window: Window, width: u32, height: u32) -> Result<()> {
         self.popup = window;
-        let geometry = self.conn.get_geometry(window)?.reply()?;
-        let width = if geometry.width > 0 {
-            u32::from(geometry.width)
-        } else {
-            width
-        };
-        let height = if geometry.height > 0 {
-            u32::from(geometry.height)
-        } else {
-            height
-        };
+        // _NET_WM_USER_TIME 0 tells the WM not to focus the window on map, and a stored time may
+        // predate the WM's last interaction. The user just requested the popup, so use now.
+        let time = self.server_time()?;
+        self.popup_hints(window, time)?;
+        self.place_popup(window, width, height)?;
+        self.conn.get_input_focus()?.reply()?; // Cross-connection round trip before iced maps the window.
+        Ok(())
+    }
+    /// Writes WM hints. Only valid while unmapped: the WM owns _NET_WM_STATE on mapped windows.
+    fn popup_hints(&self, window: Window, time: u32) -> Result<()> {
         self.conn
             .change_property32(
                 PropMode::REPLACE,
@@ -1520,7 +1643,7 @@ impl Worker {
                 window,
                 self.atoms._NET_WM_USER_TIME,
                 AtomEnum::CARDINAL,
-                &[self.timestamp],
+                &[time],
             )?
             .check()?;
         // Mark as transient so tiling WMs float the managed popup.
@@ -1533,6 +1656,21 @@ impl Worker {
                 &[self.root],
             )?
             .check()?;
+        Ok(())
+    }
+    /// Places the popup near the pointer, clamped to the monitor's work area.
+    fn place_popup(&self, window: Window, width: u32, height: u32) -> Result<()> {
+        let geometry = self.conn.get_geometry(window)?.reply()?;
+        let width = if geometry.width > 0 {
+            u32::from(geometry.width)
+        } else {
+            width
+        };
+        let height = if geometry.height > 0 {
+            u32::from(geometry.height)
+        } else {
+            height
+        };
         let pointer = self.conn.query_pointer(self.root)?.reply()?;
         let screen = &self
             .conn
@@ -1601,7 +1739,7 @@ impl Worker {
             .get_property(
                 false,
                 window,
-                self.atom("_NET_FRAME_EXTENTS")?,
+                self.atoms._NET_FRAME_EXTENTS,
                 AtomEnum::CARDINAL,
                 0,
                 4,
@@ -1621,7 +1759,6 @@ impl Worker {
         self.conn
             .configure_window(window, &ConfigureWindowAux::new().x(x).y(y))?
             .check()?;
-        self.conn.get_input_focus()?.reply()?; // Cross-connection round trip before iced maps the window.
         Ok(())
     }
     fn request_focus(&self, window: Window, timestamp: u32) -> Result<()> {
@@ -1666,7 +1803,7 @@ impl Worker {
             .get_property(
                 false,
                 self.root,
-                self.atom("_NET_SUPPORTING_WM_CHECK")?,
+                self.atoms._NET_SUPPORTING_WM_CHECK,
                 AtomEnum::WINDOW,
                 0,
                 1,
@@ -1704,18 +1841,25 @@ impl Worker {
         }
         false
     }
-    fn inject(&self, shortcut: PasteShortcut) -> Result<()> {
-        if !matches!(self.capabilities.automatic_paste, Capability::Available) {
-            bail!("automatic paste unavailable")
-        }
+    fn active_group(&self) -> usize {
         use x11rb::protocol::xkb::ConnectionExt as _;
-        let group = self
-            .conn
-            .xkb_get_state(0x100u16)
+        let Some(xkb) = &self.xkb else {
+            return 0;
+        };
+        // Drain the core events the server sends every client so they never accumulate.
+        while let Ok(Some(_)) = xkb.poll_for_event() {}
+        xkb.xkb_get_state(0x100u16) // XkbUseCoreKbd
             .ok()
             .and_then(|c| c.reply().ok())
             .map(|s| u8::from(s.group) as usize)
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+    /// Resolves the shortcut to (modifier keycodes, key keycode) in the active keyboard group.
+    fn paste_keys(&self, shortcut: PasteShortcut) -> Result<(Vec<u8>, u8)> {
+        if !matches!(self.capabilities.automatic_paste, Capability::Available) {
+            bail!("automatic paste unavailable")
+        }
+        let group = self.active_group();
         let min = self.conn.setup().min_keycode;
         let count = self.conn.setup().max_keycode - min + 1;
         let mapping = self.conn.get_keyboard_mapping(min, count)?.reply()?;
@@ -1733,12 +1877,14 @@ impl Worker {
         };
         let shift = resolve(0xffe1)?;
         let control = resolve(0xffe3)?;
-        let (key, mods) = match shortcut {
-            PasteShortcut::ControlV => (resolve(0x76)?, vec![control]),
-            PasteShortcut::ControlShiftV => (resolve(0x76)?, vec![control, shift]),
-            PasteShortcut::ShiftInsert => (resolve(0xff63)?, vec![shift]),
-        };
-        for &code in &mods {
+        Ok(match shortcut {
+            PasteShortcut::ControlV => (vec![control], resolve(0x76)?),
+            PasteShortcut::ControlShiftV => (vec![control, shift], resolve(0x76)?),
+            PasteShortcut::ShiftInsert => (vec![shift], resolve(0xff63)?),
+        })
+    }
+    fn inject(&self, mods: &[u8], key: u8) -> Result<()> {
+        for &code in mods {
             self.conn
                 .xtest_fake_input(KEY_PRESS_EVENT, code, CURRENT_TIME, self.root, 0, 0, 0)?
                 .check()?;
@@ -1765,52 +1911,77 @@ impl Worker {
                     > Duration::from_millis(self.settings.capture.generation_timeout_ms)
         }) {
             let mut input = self.incoming.take().unwrap();
-            input.omitted.push(self.name(input.target)?);
-            self.finish_capture(input)?;
+            input.omitted.push(input.target_name.clone());
+            // Report a failure here but still run the paste check below.
+            if let Err(error) = self.settle(input, Ok(Step::Finish)) {
+                self.report(error);
+            }
         }
-        self.outgoing
-            .retain(|out| now.duration_since(out.progress) < Duration::from_secs(10));
+        let mut expired = vec![];
+        self.outgoing.retain(|out| {
+            let alive = now.duration_since(out.progress) < Duration::from_secs(10);
+            if !alive {
+                expired.push(out.requestor);
+            }
+            alive
+        });
+        for requestor in expired {
+            self.release_requestor(requestor);
+        }
         if let Some(paste) = self.paste.take() {
-            let valid = self
-                .conn
-                .get_selection_owner(self.atoms.CLIPBOARD)?
-                .reply()?
-                .owner
-                == self.window;
-            let modifiers = self.conn.query_pointer(self.root)?.reply()?.mask;
-            let held = u16::from(modifiers)
-                & u16::from(
-                    KeyButMask::SHIFT
-                        | KeyButMask::CONTROL
-                        | KeyButMask::MOD1
-                        | KeyButMask::MOD4
-                        | KeyButMask::MOD5,
-                )
-                != 0;
-            if !valid {
-                self.emit(PlatformEvent::PasteResult(
-                    "Clipboard changed before paste; no keys were sent".into(),
-                ));
-            } else if self.focus_is_within(paste.target.window) && !held {
-                // Hold the server only for the final focus check and XTest requests, never while waiting.
-                self.conn.grab_server()?.check()?;
-                let result = if self.focus_is_within(paste.target.window) {
-                    self.inject(paste.shortcut)
-                } else {
-                    Err(anyhow::anyhow!("focus changed"))
-                };
-                self.conn.ungrab_server()?.check()?;
-                self.emit(PlatformEvent::PasteResult(match result {
-                    Ok(()) => "Pasted into the previous window".into(),
-                    Err(error) => format!("Copied; press your paste shortcut ({error})"),
-                }));
-            } else if now >= paste.deadline {
-                self.emit(PlatformEvent::PasteResult("Copied; press your paste shortcut (focus or modifier release could not be confirmed)".into()));
-            } else {
-                self.paste = Some(paste);
+            match self.paste_tick(&paste, now) {
+                Ok(None) => self.paste = Some(paste),
+                Ok(Some(status)) => self.emit(PlatformEvent::PasteResult(status)),
+                // A pending paste always ends with a result the user can act on.
+                Err(error) => self.emit(PlatformEvent::PasteResult(format!(
+                    "Copied; press your paste shortcut ({error})"
+                ))),
             }
         }
         Ok(())
+    }
+    /// Returns the final paste status, or None to retry on the next tick.
+    fn paste_tick(&self, paste: &PendingPaste, now: Instant) -> Result<Option<String>> {
+        let valid = self
+            .conn
+            .get_selection_owner(self.atoms.CLIPBOARD)?
+            .reply()?
+            .owner
+            == self.window;
+        if !valid {
+            return Ok(Some(
+                "Clipboard changed before paste; no keys were sent".into(),
+            ));
+        }
+        let modifiers = self.conn.query_pointer(self.root)?.reply()?.mask;
+        let held = u16::from(modifiers)
+            & u16::from(
+                KeyButMask::SHIFT
+                    | KeyButMask::CONTROL
+                    | KeyButMask::MOD1
+                    | KeyButMask::MOD4
+                    | KeyButMask::MOD5,
+            )
+            != 0;
+        if !held && self.focus_is_within(paste.target.window) {
+            // Resolve keys first so the server is held only for the final focus check and XTest.
+            let (mods, key) = self.paste_keys(paste.shortcut)?;
+            self.conn.grab_server()?.check()?;
+            let result = if self.focus_is_within(paste.target.window) {
+                self.inject(&mods, key)
+            } else {
+                Err(anyhow::anyhow!("focus changed"))
+            };
+            self.conn.ungrab_server()?.check()?;
+            return Ok(Some(match result {
+                Ok(()) => "Pasted into the previous window".into(),
+                Err(error) => format!("Copied; press your paste shortcut ({error})"),
+            }));
+        }
+        if now >= paste.deadline {
+            return Ok(Some("Copied; press your paste shortcut (focus or modifier release could not be confirmed)".into()));
+        }
+        Ok(None)
     }
     fn orderly_shutdown(&mut self) -> Result<()> {
         if self.settings.clear_clipboard_on_exit {
@@ -1829,8 +2000,21 @@ impl Worker {
                 .get_selection_owner(self.atoms.CLIPBOARD_MANAGER)?
                 .reply()?
                 .owner;
-            if manager != NONE && manager != self.window {
-                let property = self.atom("_FERITTO_HANDOFF")?;
+            if manager != NONE
+                && manager != self.window
+                && let Some(published) = &self.published
+            {
+                // Like GTK, name the targets to save; an unset property is not a valid list.
+                let mut targets: Vec<_> = published.data.keys().copied().collect();
+                targets.sort_unstable();
+                let property = self.atoms._FERITTO_HANDOFF;
+                self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.window,
+                    property,
+                    self.atoms.ATOM,
+                    &targets,
+                )?;
                 self.conn.convert_selection(
                     self.window,
                     self.atoms.CLIPBOARD_MANAGER,
@@ -1839,14 +2023,15 @@ impl Worker {
                     CURRENT_TIME,
                 )?;
                 self.conn.flush()?;
+                // Serve the manager's requests until it confirms or the handoff times out.
                 let deadline = Instant::now() + Duration::from_millis(700);
                 while Instant::now() < deadline {
-                    if let Some(event) = self.conn.poll_for_event()? {
+                    if let Some(event) = self.next_event()? {
                         if matches!(&event,Event::SelectionNotify(e) if e.selection==self.atoms.CLIPBOARD_MANAGER)
                         {
                             break;
                         }
-                        self.event(event)?;
+                        self.handle(event);
                     } else {
                         thread::sleep(Duration::from_millis(5));
                     }

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=feritto
-Comment=Keep clipboard history in your X11 session
+Comment=Keep clipboard history in your desktop session
 Exec=feritto --daemon
 Icon=io.github.gh2302.Feritto
 Terminal=false

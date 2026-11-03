@@ -1,6 +1,6 @@
 //! Shared iced state and views. Only the window runner acquires native handles.
 use feritto_core::*;
-use feritto_platform::X11Service;
+use feritto_platform::{Backend, Platform};
 use feritto_store::Store;
 use iced::{
     Element, Event,
@@ -34,7 +34,7 @@ pub enum Control {
 #[derive(Clone)]
 pub struct Services {
     pub store: Store,
-    pub platform: X11Service,
+    pub platform: Platform,
     pub controls: crossbeam_channel::Receiver<Control>,
     pub settings: Arc<Mutex<Settings>>,
     pub settings_path: PathBuf,
@@ -61,6 +61,7 @@ enum Message {
     Event(window::Id, Event, iced::event::Status),
     Opened(window::Id),
     Native(Result<u32, String>),
+    Activated(Result<bool, String>),
     Target(Result<PasteTarget, String>),
     Prepared(Result<(), String>),
     Mapped,
@@ -83,6 +84,9 @@ enum Message {
     Rtf(bool),
     Files(bool),
     Shortcut(PasteShortcut),
+    UnverifiedPaste(bool),
+    PasteSearch(Result<String, String>),
+    GrantPaste,
     MaxClips(String),
     Age(String),
     Star,
@@ -97,7 +101,9 @@ enum Message {
 
 struct App {
     services: Services,
-    popup: window::Id,
+    /// On X11 the popup is created once and hidden; on Wayland, where toolkits cannot hide or
+    /// focus an existing window, it exists only while shown.
+    popup: Option<window::Id>,
     settings_window: Option<window::Id>,
     xid: Option<u32>,
     visible: bool,
@@ -162,18 +168,21 @@ async fn background<T: Send + 'static>(
 impl App {
     fn boot(services: Services, show: bool) -> (Self, Task<Message>) {
         let settings = services.settings.lock().unwrap().clone();
-        let (popup, task) = window::open(window::Settings {
-            size: Size::new(WIDTH, HEIGHT),
-            visible: false,
-            resizable: false,
-            decorations: false,
-            exit_on_close_request: false,
-            platform_specific: window::settings::PlatformSpecific {
-                application_id: "io.github.gh2302.Feritto".into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        let wayland = services.platform.backend() == Backend::Wayland;
+        let (popup, task) = if wayland {
+            (None, Task::none())
+        } else {
+            let (id, task) = window::open(popup_settings(false));
+            (Some(id), task.map(Message::Opened))
+        };
+        let status = match services.platform.capabilities().ownership {
+            // For example GNOME Shell: there is no protocol for a background clipboard client.
+            Capability::Unavailable(reason) if wayland => {
+                format!("Clipboard history cannot work on this compositor: {reason}")
+            }
+            _ if wayland => "Copy something to start your history".into(),
+            _ => "Copy something to start your history · Ctrl+` opens feritto".into(),
+        };
         let mut app = Self {
             services,
             popup,
@@ -193,14 +202,22 @@ impl App {
             page_pending: None,
             summaries: HashMap::new(),
             thumbnails: HashMap::new(),
-            status: "Copy something to start your history · Ctrl+` opens feritto".into(),
+            status,
             settings,
             search_focused: true,
             composing: false,
             confirm_clear: false,
         };
         let search = app.search();
-        (app, Task::batch([task.map(Message::Opened), search]))
+        let show = if wayland && show {
+            app.show(None)
+        } else {
+            Task::none()
+        };
+        (app, Task::batch([task, search, show]))
+    }
+    fn wayland(&self) -> bool {
+        self.services.platform.backend() == Backend::Wayland
     }
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
@@ -288,12 +305,14 @@ impl App {
         )
     }
     fn show(&mut self, target: Option<PasteTarget>) -> Task<Message> {
-        if self.xid.is_none() {
+        let wayland = self.wayland();
+        if !wayland && self.xid.is_none() {
             self.pending_show = true;
             return Task::none();
         }
+        // On Wayland 0 means the compositor reported no target; never reuse a stale one.
         if let Some(target) = target
-            && target.window != 0
+            && (wayland || target.window != 0)
         {
             self.target = target;
         }
@@ -315,7 +334,15 @@ impl App {
         }
         Task::batch([search, self.prepare()])
     }
-    fn prepare(&self) -> Task<Message> {
+    fn prepare(&mut self) -> Task<Message> {
+        if self.wayland() {
+            if let Some(id) = self.popup {
+                return self.activate(id);
+            }
+            let (id, task) = window::open(popup_settings(true));
+            self.popup = Some(id);
+            return task.map(Message::Opened);
+        }
         let Some(xid) = self.xid else {
             return Task::none();
         };
@@ -326,10 +353,27 @@ impl App {
             Message::Prepared,
         )
     }
+    /// Wayland: uses a pending xdg-activation token so the compositor focuses the popup.
+    fn activate(&self, id: window::Id) -> Task<Message> {
+        let platform = self.services.platform.clone();
+        window::run(id, move |window| {
+            let display = window.display_handle().map_err(|e| e.to_string())?;
+            let handle = window.window_handle().map_err(|e| e.to_string())?;
+            platform.activate_window(display.as_raw(), handle.as_raw())
+        })
+        .map(Message::Activated)
+    }
     fn hide(&mut self, restore: bool) -> Task<Message> {
         self.visible = false;
         self.pending_show = false;
-        let task = window::set_mode(self.popup, window::Mode::Hidden);
+        let task = match self.popup {
+            Some(id) if self.wayland() => {
+                self.popup = None;
+                window::close(id)
+            }
+            Some(id) => window::set_mode(id, window::Mode::Hidden),
+            None => Task::none(),
+        };
         if restore {
             let platform = self.services.platform.clone();
             let target = self.target;
@@ -424,7 +468,18 @@ impl App {
                     Task::none()
                 }
             }
-            Message::Opened(id) if id == self.popup => window::run(id, |handle| {
+            Message::Opened(id) if Some(id) == self.popup && self.wayland() => {
+                self.visible = true;
+                self.mapped_at = Instant::now();
+                self.activate(id)
+            }
+            Message::Activated(result) => {
+                if let Err(error) = result {
+                    tracing::debug!(%error, "popup activation failed");
+                }
+                self.update(Message::Mapped)
+            }
+            Message::Opened(id) if Some(id) == self.popup => window::run(id, |handle| {
                 use window::raw_window_handle::RawWindowHandle;
                 match handle.window_handle().map_err(|e| e.to_string())?.as_raw() {
                     RawWindowHandle::Xlib(h) => {
@@ -432,7 +487,7 @@ impl App {
                     }
                     RawWindowHandle::Xcb(h) => Ok(h.window.get()),
                     _ => Err(
-                        "The GUI did not use the X11 backend. Wayland support is pending.".into(),
+                        "The GUI toolkit did not use the X11 backend of this X11 session.".into(),
                     ),
                 }
             })
@@ -460,10 +515,12 @@ impl App {
                 self.prepare()
             }
             Message::Prepared(Ok(())) => {
+                let Some(id) = self.popup else {
+                    return Task::none();
+                };
                 self.visible = true;
                 self.mapped_at = Instant::now();
-                window::set_mode(self.popup, window::Mode::Windowed)
-                    .chain(Task::done(Message::Mapped))
+                window::set_mode(id, window::Mode::Windowed).chain(Task::done(Message::Mapped))
             }
             Message::Prepared(Err(error)) => {
                 self.status = error;
@@ -654,6 +711,27 @@ impl App {
                 self.settings.paste_shortcut = value;
                 self.persist()
             }
+            Message::UnverifiedPaste(value) => {
+                self.settings.unverified_paste = value;
+                self.persist()
+            }
+            Message::PasteSearch(Ok(text)) => {
+                let mut query = self.query.clone();
+                query.push_str(&text.replace(['\r', '\n'], " "));
+                let search = self.update(Message::Search(query));
+                Task::batch([search, widget::operation::focus(SEARCH_ID)])
+            }
+            Message::PasteSearch(Err(error)) => {
+                self.status = error;
+                Task::none()
+            }
+            Message::GrantPaste => {
+                let platform = self.services.platform.clone();
+                Task::perform(
+                    background(move || platform.request_paste_permission()),
+                    Message::Done,
+                )
+            }
             Message::MaxClips(value) => {
                 if let Ok(value) = value.parse::<usize>() {
                     self.settings.max_clips = value.clamp(1, 100000);
@@ -749,7 +827,7 @@ impl App {
             }
             return Task::none();
         }
-        if id != self.popup {
+        if Some(id) != self.popup {
             return Task::none();
         }
         match event {
@@ -801,6 +879,20 @@ impl App {
                 Key::Character(c) if modifiers.control() && c.eq_ignore_ascii_case("l") => {
                     self.search_focused = true;
                     widget::operation::focus(SEARCH_ID)
+                }
+                // On Wayland the GUI has no clipboard connection; the platform service supplies it.
+                Key::Character(c)
+                    if self.wayland()
+                        && self.search_focused
+                        && modifiers.control()
+                        && !modifiers.alt()
+                        && c.eq_ignore_ascii_case("v") =>
+                {
+                    let platform = self.services.platform.clone();
+                    Task::perform(
+                        background(move || platform.clipboard_text()),
+                        Message::PasteSearch,
+                    )
                 }
                 Key::Character(c) if modifiers.control() && c == "," => {
                     self.update(Message::Settings)
@@ -1016,6 +1108,21 @@ impl App {
     }
     fn settings_view(&self) -> Element<'_, Message> {
         let caps = self.services.platform.capabilities();
+        let mut wayland_paste = column![].spacing(8);
+        if self.wayland() {
+            if matches!(caps.automatic_paste, Capability::PermissionRequired(_)) {
+                wayland_paste = wayland_paste.push(
+                    button("Allow keyboard control for automatic paste…")
+                        .on_press(Message::GrantPaste)
+                        .style(button::secondary),
+                );
+            }
+            wayland_paste = wayland_paste.push(
+                checkbox(self.settings.unverified_paste)
+                    .label("Paste even when the compositor cannot confirm the target window")
+                    .on_toggle(Message::UnverifiedPaste),
+            );
+        }
         let status = |name: &str, cap: Capability| {
             text(format!(
                 "{name}: {}",
@@ -1028,29 +1135,123 @@ impl App {
             ))
             .size(12)
         };
-        let content=column![
-            text("Settings").size(28),text("Changes are saved automatically.").size(13),
-            checkbox(self.settings.paused).label("Pause clipboard capture").on_toggle(Message::Pause),
-            checkbox(self.settings.automatic_paste).label("Paste automatically after choosing a clip").on_toggle(Message::AutoPaste),
-            row![button("Ctrl+V").on_press(Message::Shortcut(PasteShortcut::ControlV)),button("Ctrl+Shift+V").on_press(Message::Shortcut(PasteShortcut::ControlShiftV)),button("Shift+Insert (PRIMARY)").on_press(Message::Shortcut(PasteShortcut::ShiftInsert))].spacing(6),
-            text(format!("Paste shortcut: {:?}",self.settings.paste_shortcut)).size(12),
-            checkbox(self.settings.dark_theme).label("Dark theme").on_toggle(Message::Dark),
-            checkbox(self.settings.coexistence).label("History only: let another manager retain the clipboard").on_toggle(Message::Coexist),
+        let content = column![
+            text("Settings").size(28),
+            text("Changes are saved automatically.").size(13),
+            checkbox(self.settings.paused)
+                .label("Pause clipboard capture")
+                .on_toggle(Message::Pause),
+            checkbox(self.settings.automatic_paste)
+                .label("Paste automatically after choosing a clip")
+                .on_toggle(Message::AutoPaste),
+            row![
+                button("Ctrl+V").on_press(Message::Shortcut(PasteShortcut::ControlV)),
+                button("Ctrl+Shift+V").on_press(Message::Shortcut(PasteShortcut::ControlShiftV)),
+                button("Shift+Insert (PRIMARY)")
+                    .on_press(Message::Shortcut(PasteShortcut::ShiftInsert))
+            ]
+            .spacing(6),
+            text(format!(
+                "Paste shortcut: {:?}",
+                self.settings.paste_shortcut
+            ))
+            .size(12),
+            checkbox(self.settings.dark_theme)
+                .label("Dark theme")
+                .on_toggle(Message::Dark),
+            checkbox(self.settings.coexistence)
+                .label("History only: let another manager retain the clipboard")
+                .on_toggle(Message::Coexist),
             text("Capture formats").size(18),
-            row![checkbox(self.settings.capture.text).label("Text").on_toggle(Message::Text),checkbox(self.settings.capture.images).label("PNG images").on_toggle(Message::Images),checkbox(self.settings.capture.html).label("HTML").on_toggle(Message::Html)].spacing(16),
-            row![checkbox(self.settings.capture.rtf).label("RTF").on_toggle(Message::Rtf),checkbox(self.settings.capture.files).label("File / URI lists").on_toggle(Message::Files)].spacing(16),
+            row![
+                checkbox(self.settings.capture.text)
+                    .label("Text")
+                    .on_toggle(Message::Text),
+                checkbox(self.settings.capture.images)
+                    .label("PNG images")
+                    .on_toggle(Message::Images),
+                checkbox(self.settings.capture.html)
+                    .label("HTML")
+                    .on_toggle(Message::Html)
+            ]
+            .spacing(16),
+            row![
+                checkbox(self.settings.capture.rtf)
+                    .label("RTF")
+                    .on_toggle(Message::Rtf),
+                checkbox(self.settings.capture.files)
+                    .label("File / URI lists")
+                    .on_toggle(Message::Files)
+            ]
+            .spacing(16),
             text("Retention · starred clips are protected").size(18),
-            row![column![text("Maximum clips").size(12),text_input("10000",&self.settings.max_clips.to_string()).on_input(Message::MaxClips).padding(8)],column![text("Maximum age in days (0 = unlimited)").size(12),text_input("30",&self.settings.max_age_days.to_string()).on_input(Message::Age).padding(8)]].spacing(12),
-            text("Desktop capabilities").size(18),status("Backend",Capability::Unavailable(caps.backend)),status("Global shortcut (Ctrl+grave)",caps.global_hotkey),status("Automatic paste",caps.automatic_paste),status("Clipboard recovery",caps.persistence),status("Caret",caps.caret_placement),
-            text("Wayland support is pending. Clipboard files are private to your user and are stored unencrypted.").size(12),
-            row![button("Clear clipboard").on_press(Message::ClearClipboard).style(button::secondary),button(if self.confirm_clear {"Confirm: delete all history"}else{"Clear history…"}).on_press(if self.confirm_clear {Message::ConfirmClearHistory}else{Message::ClearHistory}).style(button::danger)].spacing(12),
-            text(&self.status).size(12),button("Quit feritto").on_press(Message::Quit).style(button::secondary),
-        ].spacing(14);
+            row![
+                column![
+                    text("Maximum clips").size(12),
+                    text_input("10000", &self.settings.max_clips.to_string())
+                        .on_input(Message::MaxClips)
+                        .padding(8)
+                ],
+                column![
+                    text("Maximum age in days (0 = unlimited)").size(12),
+                    text_input("30", &self.settings.max_age_days.to_string())
+                        .on_input(Message::Age)
+                        .padding(8)
+                ]
+            ]
+            .spacing(12),
+            text("Desktop capabilities").size(18),
+            status("Backend", Capability::Unavailable(caps.backend)),
+            status("Clipboard monitoring", caps.monitor),
+            status("Global shortcut (Ctrl+grave)", caps.global_hotkey),
+            status("Automatic paste", caps.automatic_paste.clone()),
+            status("Source application", caps.source_identity),
+            status("Clipboard recovery", caps.persistence),
+            status("Caret", caps.caret_placement),
+            wayland_paste,
+            text("Clipboard files are private to your user and are stored unencrypted.").size(12),
+            row![
+                button("Clear clipboard")
+                    .on_press(Message::ClearClipboard)
+                    .style(button::secondary),
+                button(if self.confirm_clear {
+                    "Confirm: delete all history"
+                } else {
+                    "Clear history…"
+                })
+                .on_press(if self.confirm_clear {
+                    Message::ConfirmClearHistory
+                } else {
+                    Message::ClearHistory
+                })
+                .style(button::danger)
+            ]
+            .spacing(12),
+            text(&self.status).size(12),
+            button("Quit feritto")
+                .on_press(Message::Quit)
+                .style(button::secondary),
+        ]
+        .spacing(14);
         container(scrollable(content))
             .padding(24)
             .width(Fill)
             .height(Fill)
             .into()
+    }
+}
+fn popup_settings(visible: bool) -> window::Settings {
+    window::Settings {
+        size: Size::new(WIDTH, HEIGHT),
+        visible,
+        resizable: false,
+        decorations: false,
+        exit_on_close_request: false,
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "io.github.gh2302.Feritto".into(),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 fn format_bytes(bytes: u64) -> String {

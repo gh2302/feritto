@@ -1,4 +1,4 @@
-use crate::{ContextData, Request};
+use crate::{ContextData, Envelope};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -49,7 +49,7 @@ impl Drop for Instance {
         let _ = fs::remove_file(&self.socket);
     }
 }
-pub fn forward(socket: &Path, request: &Request) -> Result<Option<Value>> {
+pub fn forward(socket: &Path, request: &Envelope) -> Result<Option<Value>> {
     let mut stream = match UnixStream::connect(socket) {
         Ok(s) => s,
         Err(e)
@@ -90,7 +90,7 @@ pub fn serve(listener: UnixListener, context: ContextData) -> Result<()> {
                     if line.len() as u64 > MAX_REQUEST || !line.ends_with('\n') {
                         bail!("IPC request is too large or incomplete")
                     }
-                    context.handle(serde_json::from_str(&line)?)
+                    context.handle_envelope(serde_json::from_str(&line)?)
                 })();
                 let reply = match result {
                     Ok(v) => v,

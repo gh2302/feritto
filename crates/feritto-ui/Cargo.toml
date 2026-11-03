@@ -18,3 +18,11 @@ serde_json.workspace = true
 iced.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# The Wayland GUI backend is enabled here instead of through iced's `wayland` feature. That
+# feature also attaches iced's own Wayland clipboard to the first window and reconnects it
+# whenever that window closes. The Wayland popup closes on every hide, and a selection change
+# during that teardown desynchronizes libwayland's object IDs and kills the GUI connection.
+# feritto owns the clipboard through its platform service, so the GUI needs no data device.
+# iced's `x11` feature already sets the window name, which winit uses as the Wayland app_id.
+winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
+softbuffer = { version = "0.4", default-features = false, features = ["wayland", "wayland-dlopen"] }

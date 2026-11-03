@@ -1,4 +1,4 @@
-name: Rust and X11
+name: Rust, X11 and Wayland
 on: [push, pull_request]
 jobs:
   verify:
@@ -19,3 +19,7 @@ jobs:
       - run: cargo check --locked -p feritto --features wgpu
       - name: X11 protocol and desktop integration
         run: scripts/check-x11.sh
+      - name: Install headless Wayland test tools
+        run: sudo apt-get install -y sway wl-clipboard wev wtype foot dbus
+      - name: Wayland protocol and desktop integration (headless sway)
+        run: scripts/check-wayland.sh sway

@@ -246,8 +246,12 @@ pub fn is_protocol_target(target: &str) -> bool {
             | "x-kde-passwordManagerHint"
             | "application/x-feritto-ignore"
             | "Clipboard Viewer Ignore"
-    )
+    ) || target.starts_with(OWNER_MARKER)
 }
+
+/// Prefix of the private per-instance type feritto adds to the offers it owns on Wayland.
+/// It identifies its own selection; it is never captured, stored, or served from history.
+pub const OWNER_MARKER: &str = "application/x-feritto-owner";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -262,6 +266,9 @@ pub struct Settings {
     pub coexistence: bool,
     pub dark_theme: bool,
     pub clear_clipboard_on_exit: bool,
+    /// Wayland only: inject the paste shortcut even when the compositor cannot confirm which
+    /// window regained focus after the popup closed.
+    pub unverified_paste: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -276,6 +283,7 @@ impl Default for Settings {
             coexistence: false,
             dark_theme: true,
             clear_clipboard_on_exit: false,
+            unverified_paste: false,
         }
     }
 }
@@ -327,7 +335,11 @@ mod tests {
     #[test]
     fn policy_resolves_aliases_and_ignores_protocol() {
         let policy = CapturePolicy {
-            extra_targets: vec!["INCR".into(), "application/test".into()],
+            extra_targets: vec![
+                "INCR".into(),
+                "application/test".into(),
+                "application/x-feritto-owner-1-1".into(),
+            ],
             ..Default::default()
         };
         let offered = [
@@ -338,6 +350,7 @@ mod tests {
             "TARGETS",
             "INCR",
             "application/test",
+            "application/x-feritto-owner-1-1",
         ]
         .map(String::from);
         assert_eq!(

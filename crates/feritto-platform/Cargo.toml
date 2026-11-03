@@ -11,4 +11,13 @@ anyhow.workspace = true
 crossbeam-channel.workspace = true
 x11rb.workspace = true
 tracing.workspace = true
-rustix = { version = "1", features = ["event"] }
+rustix = { version = "1", features = ["event", "fs", "pipe"] }
+wayland-client.workspace = true
+wayland-backend.workspace = true
+wayland-protocols.workspace = true
+wayland-protocols-wlr.workspace = true
+wayland-protocols-misc.workspace = true
+ashpd.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+raw-window-handle.workspace = true
+futures-util = "0.3"
