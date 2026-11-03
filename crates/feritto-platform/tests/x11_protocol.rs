@@ -318,6 +318,86 @@ fn capture_serve_large_persist_clear_and_secret() -> Result<()> {
     assert_eq!(retained, expected);
     conn.destroy_window(source)?.check()?;
     wait_text("Unicode café 世界".as_bytes());
+    // A focus change while a held modifier delays paste must never inject into the new window.
+    while events.try_recv().is_ok() {}
+    let intended = conn.generate_id()?;
+    let unrelated = conn.generate_id()?;
+    for window in [intended, unrelated] {
+        conn.create_window(
+            0,
+            window,
+            root,
+            0,
+            0,
+            80,
+            80,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new().event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+        )?
+        .check()?;
+        conn.map_window(window)?.check()?;
+    }
+    conn.set_input_focus(InputFocus::PARENT, unrelated, 0u32)?
+        .check()?;
+    let min = conn.setup().min_keycode;
+    let mapping = conn
+        .get_keyboard_mapping(min, conn.setup().max_keycode - min + 1)?
+        .reply()?;
+    let resolve = |symbol| {
+        mapping
+            .keysyms
+            .chunks(mapping.keysyms_per_keycode as usize)
+            .position(|syms| syms.first() == Some(&symbol))
+            .map(|i| min + i as u8)
+            .unwrap()
+    };
+    let ctrl = resolve(0xffe3);
+    let v = resolve(0x76);
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    conn.xtest_fake_input(KEY_PRESS_EVENT, ctrl, 0, root, 0, 0, 0)?
+        .check()?;
+    service
+        .paste(
+            Arc::new(Offer::text("safe clipboard fallback")),
+            PasteTarget {
+                window: intended,
+                timestamp: 0,
+            },
+            PasteShortcut::ControlV,
+        )
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    while conn.get_input_focus()?.reply()?.focus != intended {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    conn.set_input_focus(InputFocus::PARENT, unrelated, 0u32)?
+        .check()?;
+    conn.xtest_fake_input(KEY_RELEASE_EVENT, ctrl, 0, root, 0, 0, 0)?
+        .check()?;
+    conn.flush()?;
+    let end = Instant::now() + Duration::from_secs(2);
+    let mut fallback = false;
+    while Instant::now() < end && !fallback {
+        if let Ok(PlatformEvent::PasteResult(status)) =
+            events.recv_timeout(Duration::from_millis(20))
+        {
+            assert!(status.starts_with("Copied;"));
+            fallback = true;
+        }
+    }
+    assert!(fallback, "focus failure was not reported");
+    while let Some(event) = conn.poll_for_event()? {
+        if let x11rb::protocol::Event::KeyPress(key) = event {
+            assert_ne!(
+                key.detail, v,
+                "paste was injected after the target lost focus"
+            );
+        }
+    }
+    wait_text(b"safe clipboard fallback");
     service.shutdown();
     Ok(())
 }
