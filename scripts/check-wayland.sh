@@ -8,7 +8,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 compositor_name=${1:-sway}
-cargo build --locked -p feritto
+if [[ -z ${FERITTO_BINARY:-} ]]; then
+    cargo build --locked -p feritto
+fi
 
 base=$(mktemp -d /tmp/feritto-wayland-XXXXXX)
 chmod 700 "$base"

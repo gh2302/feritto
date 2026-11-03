@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the workspace version and a default-branch commit
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo "Release tag $RELEASE_TAG must match workspace version v$version" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor HEAD "refs/remotes/origin/$DEFAULT_BRANCH"
+
+  verify:
+    name: Release validation
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish GitHub Release
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: github-releases
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: feritto-linux-x86_64
+          path: dist
+      - name: Verify checksums and publish tested artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          options=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
+            if [[ "$draft" != true ]]; then
+              echo "Refusing to overwrite an already published release" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "$RELEASE_TAG" --generate-notes "${options[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false

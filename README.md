@@ -102,6 +102,22 @@ For optional autostart, copy
 `assets/desktop/io.github.gh2302.Feritto-autostart.desktop` into
 `~/.config/autostart/`. Remove that file to disable autostart.
 
+## CI and releases
+
+GitHub Actions checks formatting, Clippy, workspace tests, the optional GPU build,
+and isolated X11 and Wayland desktop integration. It also builds and validates
+Linux x86_64 `.tar.gz` and `.deb` packages, available as CI artifacts for 14 days.
+
+Pushing a version tag such as `v0.1.0` re-runs the full CI pipeline and publishes
+those exact packages and `SHA256SUMS` to GitHub Releases only after every check
+passes. The tag must match the workspace version and point to a commit already
+on the default branch. No external deployment service or personal token is needed.
+
+Build packages locally with `make package && make test-package` (requires
+`dpkg-dev`, `desktop-file-utils`, and Python 3.11+). Outputs go to `dist/`.
+See [GitHub setup and release instructions](docs/github.md) for repository
+protection settings, installation commands, and the release procedure.
+
 ## Data and clipboard behavior
 
 History lives in `$XDG_DATA_HOME/feritto` (default `~/.local/share/feritto`),

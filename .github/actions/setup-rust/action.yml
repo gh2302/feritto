@@ -1,0 +1,31 @@
+name: Set up Linux Rust build
+description: Install native dependencies, the repository toolchain and a scoped Rust cache.
+
+inputs:
+  cache-key:
+    description: Cache scope for this job's build configuration.
+    required: true
+  packages:
+    description: Additional space-separated Debian packages for this job.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux build dependencies
+      shell: bash
+      env:
+        EXTRA_PACKAGES: ${{ inputs.packages }}
+      run: |
+        read -r -a packages <<< "$EXTRA_PACKAGES"
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends \
+          build-essential pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-0 \
+          libfontconfig1-dev libxcb-shape0-dev libxcb-xfixes0-dev "${packages[@]}"
+    - name: Install toolchain from rust-toolchain.toml
+      shell: bash
+      run: rustup show active-toolchain
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      with:
+        key: ${{ inputs.cache-key }}
+        save-if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}

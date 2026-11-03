@@ -1,25 +1,141 @@
-name: Rust, X11 and Wayland
-on: [push, pull_request]
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  verify:
+  quality:
+    name: Formatting and lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install desktop build and test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-0 libfontconfig1-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb xauth xclip xdotool i3-wm xfwm4 xterm dbus-x11 x11-utils fonts-dejavu-core
-      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - run: cargo check --locked -p feritto --features wgpu
-      - name: X11 protocol and desktop integration
-        run: scripts/check-x11.sh
-      - name: Install headless Wayland test tools
-        run: sudo apt-get install -y sway wl-clipboard wev wtype foot dbus
-      - name: Wayland protocol and desktop integration (headless sway)
-        run: scripts/check-wayland.sh sway
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: quality
+          packages: shellcheck
+      - name: Check workflow syntax and shell scripts
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+          shellcheck scripts/package.sh scripts/check-package.sh
+      - name: Check formatting, Clippy and optional GPU build
+        run: make check
+
+  test:
+    name: Workspace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test
+      - run: make test
+
+  desktop:
+    name: Desktop (${{ matrix.backend }})
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: x11
+            packages: xvfb xauth xclip xdotool i3-wm xfwm4 xterm dbus-x11 x11-utils fonts-dejavu-core
+            target: test-x11
+          - backend: wayland
+            packages: sway wl-clipboard wev wtype foot dbus fonts-dejavu-core
+            target: test-wayland
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: desktop-${{ matrix.backend }}
+          packages: ${{ matrix.packages }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: feritto-linux-x86_64
+          path: dist
+      - name: Prepare the packaged release binary
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          package_root=$(mktemp -d "$RUNNER_TEMP/feritto-package-XXXXXX")
+          tar -xzf dist/*.tar.gz --strip-components=1 -C "$package_root"
+          echo "FERITTO_BINARY=$package_root/bin/feritto" >> "$GITHUB_ENV"
+      - name: Run isolated protocol and desktop tests
+        env:
+          MAKE_TARGET: ${{ matrix.target }}
+        run: make "$MAKE_TARGET"
+
+  package:
+    name: Linux release packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: package
+          packages: dpkg-dev desktop-file-utils
+      - name: Build and validate release packages
+        run: |
+          make package
+          make test-package
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: feritto-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  required:
+    name: Required checks
+    if: always()
+    needs: [quality, test, desktop, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [[ "$result" != success ]]; then
+              echo "A required job did not succeed: $RESULTS" >&2
+              exit 1
+            fi
+          done
