@@ -227,7 +227,11 @@ fn run() -> Result<()> {
     }
     tracing::info!(
         backend = "X11",
-        renderer = "tiny-skia",
+        renderer = if cfg!(feature = "wgpu") {
+            "wgpu with tiny-skia fallback"
+        } else {
+            "tiny-skia"
+        },
         "desktop service started"
     );
     feritto_ui::run(

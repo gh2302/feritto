@@ -3,6 +3,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use feritto_core::*;
 use std::{
     collections::{HashMap, VecDeque},
+    os::unix::net::UnixDatagram,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -60,14 +61,43 @@ enum Command {
 }
 
 #[derive(Clone)]
+struct ServiceSender {
+    commands: Sender<Command>,
+    wake: Arc<UnixDatagram>,
+}
+impl ServiceSender {
+    fn send(&self, command: Command) -> ServiceResult<()> {
+        self.commands
+            .send(command)
+            .map_err(|_| "X11 worker stopped".to_owned())?;
+        let _ = self.wake.send(&[1]);
+        Ok(())
+    }
+    fn send_timeout(&self, command: Command, timeout: Duration) -> ServiceResult<()> {
+        self.commands
+            .send_timeout(command, timeout)
+            .map_err(|_| "X11 command queue is unavailable".to_owned())?;
+        let _ = self.wake.send(&[1]);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct X11Service {
-    tx: Sender<Command>,
+    tx: ServiceSender,
     capabilities: Arc<Mutex<Capabilities>>,
 }
 impl X11Service {
     pub fn start(settings: Settings) -> Result<(Self, Receiver<PlatformEvent>)> {
         super::require_x11_session()?;
-        let (tx, rx) = bounded(64);
+        let (commands, rx) = bounded(64);
+        let (wake, worker_wake) = UnixDatagram::pair()?;
+        wake.set_nonblocking(true)?;
+        worker_wake.set_nonblocking(true)?;
+        let tx = ServiceSender {
+            commands,
+            wake: Arc::new(wake),
+        };
         let (events_tx, events_rx) = bounded(64);
         let mut worker = Worker::connect(settings, events_tx)?;
         let capabilities = Arc::new(Mutex::new(worker.capabilities.clone()));
@@ -75,7 +105,7 @@ impl X11Service {
         thread::Builder::new()
             .name("feritto-x11".into())
             .spawn(move || {
-                if let Err(error) = worker.run(rx) {
+                if let Err(error) = worker.run(rx, worker_wake) {
                     worker.emit(PlatformEvent::Status(format!(
                         "X11 service stopped: {error}"
                     )));
@@ -346,12 +376,14 @@ impl Worker {
     fn name(&self, atom: Atom) -> Result<String> {
         Ok(String::from_utf8_lossy(&self.conn.get_atom_name(atom)?.reply()?.name).into_owned())
     }
-    fn run(&mut self, rx: Receiver<Command>) -> Result<()> {
+    fn run(&mut self, rx: Receiver<Command>, wake: UnixDatagram) -> Result<()> {
         loop {
+            let mut event_count = 0;
             for _ in 0..256 {
                 let Some(event) = self.conn.poll_for_event()? else {
                     break;
                 };
+                event_count += 1;
                 if let Err(error) = self.event(event) {
                     tracing::warn!(%error,"X11 operation failed");
                     self.emit(PlatformEvent::Status(format!(
@@ -359,18 +391,56 @@ impl Worker {
                     )));
                 }
             }
-            self.timeouts()?;
-            match rx.recv_timeout(Duration::from_millis(12)) {
-                Ok(Command::Shutdown(reply)) => {
-                    self.orderly_shutdown()?;
-                    let _ = reply.send(());
-                    return Ok(());
+            let mut command_count = 0;
+            for _ in 0..64 {
+                match rx.try_recv() {
+                    Ok(Command::Shutdown(reply)) => {
+                        self.orderly_shutdown()?;
+                        let _ = reply.send(());
+                        return Ok(());
+                    }
+                    Ok(command) => {
+                        command_count += 1;
+                        self.command(command);
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
                 }
-                Ok(command) => self.command(command),
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             }
+            self.timeouts()?;
             self.conn.flush()?;
+            if event_count == 256 || command_count > 0 {
+                continue;
+            }
+            // Reply round trips can buffer events inside x11rb even when the socket is no longer readable.
+            if let Some(event) = self.conn.poll_for_event()? {
+                if let Err(error) = self.event(event) {
+                    tracing::warn!(%error,"X11 operation failed");
+                    self.emit(PlatformEvent::Status(format!(
+                        "X11 operation failed: {error}"
+                    )));
+                }
+                continue;
+            }
+            // Sleep on both native events and commands. Idle timeouts only detect a dropped handle;
+            // active transfers/focus retries keep their bounded deadlines without polling at idle.
+            let active =
+                self.incoming.is_some() || !self.outgoing.is_empty() || self.paste.is_some();
+            let timeout = rustix::event::Timespec {
+                tv_sec: if active { 0 } else { 1 },
+                tv_nsec: if active { 10_000_000 } else { 0 },
+            };
+            let mut fds = [
+                rustix::event::PollFd::new(self.conn.stream(), rustix::event::PollFlags::IN),
+                rustix::event::PollFd::new(&wake, rustix::event::PollFlags::IN),
+            ];
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let mut bytes = [0; 64];
+            while wake.recv(&mut bytes).is_ok() {}
         }
     }
     fn command(&mut self, command: Command) {
@@ -462,6 +532,8 @@ impl Worker {
             }
             Command::FocusPopup(window) => {
                 self.popup = window;
+                // The WM publishes frame extents only after the first map. Clamp the managed frame before activation.
+                let _ = self.prepare(window, 0, 0);
                 let _ = self.request_focus(window, self.timestamp);
             }
             Command::Restore(target) => {
@@ -737,7 +809,13 @@ impl Worker {
                 input.property,
                 AtomEnum::ANY,
                 0,
-                (self.settings.capture.max_target_bytes / 4 + 1) as u32,
+                if input.stage == Stage::Targets {
+                    4097
+                } else if input.stage == Stage::Secret {
+                    17
+                } else {
+                    (self.settings.capture.max_target_bytes / 4 + 1) as u32
+                },
             )?
             .reply()?;
         input.progress = Instant::now();
@@ -747,6 +825,10 @@ impl Worker {
                 return Ok(());
             }
             let targets: Vec<Atom> = reply.value32().into_iter().flatten().take(4096).collect();
+            if targets.len() > 4096 {
+                self.drop_capture(input);
+                return Ok(());
+            }
             let mut names = Vec::new();
             for &atom in &targets {
                 names.push(self.name(atom)?);
@@ -1514,8 +1596,28 @@ impl Worker {
                 bottom = bottom.min(area[1].saturating_add(area[3]) as i32);
             }
         }
-        let x = (i32::from(pointer.root_x) + 12).clamp(left, (right - width as i32).max(left));
-        let y = (i32::from(pointer.root_y) + 12).clamp(top, (bottom - height as i32).max(top));
+        let frame = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atom("_NET_FRAME_EXTENTS")?,
+                AtomEnum::CARDINAL,
+                0,
+                4,
+            )?
+            .reply()?;
+        let frame: Vec<_> = frame.value32().into_iter().flatten().collect();
+        let outer_width = width
+            .saturating_add(frame.first().copied().unwrap_or(0))
+            .saturating_add(frame.get(1).copied().unwrap_or(0));
+        let outer_height = height
+            .saturating_add(frame.get(2).copied().unwrap_or(0))
+            .saturating_add(frame.get(3).copied().unwrap_or(0));
+        let x =
+            (i32::from(pointer.root_x) + 12).clamp(left, (right - outer_width as i32).max(left));
+        let y =
+            (i32::from(pointer.root_y) + 12).clamp(top, (bottom - outer_height as i32).max(top));
         self.conn
             .configure_window(window, &ConfigureWindowAux::new().x(x).y(y))?
             .check()?;

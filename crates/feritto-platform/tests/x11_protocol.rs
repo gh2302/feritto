@@ -215,6 +215,151 @@ fn capture_serve_large_persist_clear_and_secret() -> Result<()> {
     );
     service.clear().unwrap();
     assert_eq!(conn.get_selection_owner(clipboard)?.reply()?.owner, 0);
+    // One real owner exposes several formats plus private and alias targets. Only configured data is fetched.
+    let source = conn.generate_id()?;
+    conn.create_window(
+        0,
+        source,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new(),
+    )?
+    .check()?;
+    let html = atom(b"text/html");
+    let rtf = atom(b"text/rtf");
+    let uri = atom(b"text/uri-list");
+    let opaque = atom(b"application/x-feritto-fixture");
+    let private = atom(b"application/x-private");
+    let formats = vec![
+        (text, "Unicode café 世界".as_bytes().to_vec()),
+        (html, b"<b>cafe</b>".to_vec()),
+        (rtf, b"{\\rtf1 cafe}".to_vec()),
+        (uri, b"file:///tmp/fixture\r\n".to_vec()),
+        (opaque, vec![0, 255, 1, 0, 42]),
+    ];
+    let mut settings = Settings::default();
+    settings.capture.extra_targets = vec!["application/x-feritto-fixture".into()];
+    service.configure(settings);
+    service.active_window().unwrap(); // command barrier
+    conn.set_selection_owner(source, clipboard, 0u32)?.check()?;
+    conn.flush()?;
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut captured = None;
+    while Instant::now() < end && captured.is_none() {
+        while let Some(event) = conn.poll_for_event()? {
+            if let x11rb::protocol::Event::SelectionRequest(e) = event {
+                respond(&conn, e, targets, &formats, Some(private))?;
+            }
+        }
+        while let Ok(event) = events.try_recv() {
+            if let PlatformEvent::Captured(c) = event {
+                captured = Some(c)
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let captured = captured.expect("multi-format capture");
+    assert!(captured.complete);
+    assert_eq!(captured.offer.representations.len(), formats.len());
+    service.publish(captured.offer.clone()).unwrap();
+    for (target, bytes) in &formats {
+        let name = String::from_utf8(conn.get_atom_name(*target)?.reply()?.name)?;
+        let result = Command::new("xclip")
+            .args(["-selection", "clipboard", "-o", "-target", &name])
+            .output()?;
+        assert!(result.status.success());
+        assert_eq!(&result.stdout, bytes);
+    }
+    // Cooperative SAVE_TARGETS retains only the requested, supported target set.
+    let manager = atom(b"CLIPBOARD_MANAGER");
+    let save = atom(b"SAVE_TARGETS");
+    let saved_prop = atom(b"TEST_SAVE_TARGETS");
+    conn.set_selection_owner(source, clipboard, 0u32)?.check()?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        source,
+        saved_prop,
+        AtomEnum::ATOM,
+        &[text, html],
+    )?;
+    conn.convert_selection(source, manager, save, saved_prop, 0u32)?;
+    conn.flush()?;
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut saved = false;
+    while Instant::now() < end && !saved {
+        while let Some(event) = conn.poll_for_event()? {
+            match event {
+                x11rb::protocol::Event::SelectionRequest(e) => {
+                    respond(&conn, e, targets, &formats, Some(private))?
+                }
+                x11rb::protocol::Event::SelectionNotify(e) if e.selection == manager => {
+                    assert_eq!(e.property, saved_prop);
+                    saved = true;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(saved, "SAVE_TARGETS did not complete");
+    let retained = conn
+        .get_property(false, source, saved_prop, AtomEnum::ATOM, 0, 16)?
+        .reply()?;
+    let mut retained: Vec<_> = retained.value32().unwrap().collect();
+    retained.sort_unstable();
+    let mut expected = vec![text, html];
+    expected.sort_unstable();
+    assert_eq!(retained, expected);
+    conn.destroy_window(source)?.check()?;
+    wait_text("Unicode café 世界".as_bytes());
     service.shutdown();
+    Ok(())
+}
+
+fn respond(
+    conn: &x11rb::rust_connection::RustConnection,
+    e: SelectionRequestEvent,
+    targets: Atom,
+    formats: &[(Atom, Vec<u8>)],
+    private: Option<Atom>,
+) -> Result<()> {
+    use x11rb::wrapper::ConnectionExt as _;
+    if e.target == targets {
+        let mut offered: Vec<_> = formats.iter().map(|(a, _)| *a).collect();
+        offered.push(targets);
+        offered.extend(private);
+        conn.change_property32(
+            PropMode::REPLACE,
+            e.requestor,
+            e.property,
+            AtomEnum::ATOM,
+            &offered,
+        )?;
+    } else if let Some((_, bytes)) = formats.iter().find(|(a, _)| *a == e.target) {
+        conn.change_property8(PropMode::REPLACE, e.requestor, e.property, e.target, bytes)?;
+    } else {
+        panic!("unconfigured/private target requested")
+    }
+    conn.send_event(
+        false,
+        e.requestor,
+        EventMask::NO_EVENT,
+        SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: e.time,
+            requestor: e.requestor,
+            selection: e.selection,
+            target: e.target,
+            property: e.property,
+        },
+    )?;
+    conn.flush()?;
     Ok(())
 }

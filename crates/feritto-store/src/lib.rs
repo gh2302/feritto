@@ -481,4 +481,77 @@ mod tests {
         assert!(Repository::open(dir.path().to_path_buf()).is_err());
         Ok(())
     }
+    #[test]
+    fn thumbnails_and_orphan_recovery() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("data");
+        let mut repo = Repository::open(path.clone())?;
+        let image = image::DynamicImage::new_rgb8(640, 480);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png)?;
+        let original = png.into_inner();
+        let offer = Offer {
+            representations: vec![Representation {
+                target: "image/png".into(),
+                mime: Some("image/png".into()),
+                bytes: Arc::from(original.clone()),
+            }],
+        };
+        let id = repo.insert(&capture(offer), &Settings::default())?;
+        let thumbnail = repo.thumbnail(id)?.unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (240, 180));
+        assert_eq!(repo.offer(id)?.representations[0].bytes.as_ref(), original);
+        let summaries = repo.summaries(&[id])?;
+        assert!(summaries[0].has_image);
+        fs::write(path.join("payloads/orphan.pending"), b"interrupted write")?;
+        drop(repo);
+        let _repo = Repository::open(path.clone())?;
+        assert!(!path.join("payloads/orphan.pending").exists());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "100,000-row search qualification; run explicitly with --ignored --nocapture"]
+    fn search_100k() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut repo = Repository::open(dir.path().to_path_buf())?;
+        let tx = repo.db.transaction()?;
+        {
+            let mut insert=tx.prepare("INSERT INTO clips(id,captured_at,content_hash,preview,search_text,size,source) VALUES(?1,?1,?2,?3,?4,100,'{}')")?;
+            for id in 1..=100000 {
+                let text = format!(
+                    "Clip {id:06} Straße café {}",
+                    if id % 1000 == 0 {
+                        "needle literal%_quote"
+                    } else {
+                        "ordinary"
+                    }
+                );
+                insert.execute(params![id, id.to_string(), text, normalize_search(&text)])?;
+            }
+        }
+        tx.commit()?;
+        for (query, expected) in [
+            ("needle", 100),
+            ("STRASSE", 100000),
+            ("cafe\u{301}", 100000),
+            ("literal%_", 100),
+            ("ne", 100),
+            ("7", 40951),
+        ] {
+            let mut times = Vec::new();
+            for _ in 0..10 {
+                let now = std::time::Instant::now();
+                let ids = repo.search_ids(query)?;
+                times.push(now.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(ids.len(), expected);
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "query={query:?}, results={expected}, p95_ms={:.2}",
+                times[9]
+            );
+        }
+        Ok(())
+    }
 }

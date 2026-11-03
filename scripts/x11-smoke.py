@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Repeatable desktop checks. Invoke through scripts/check-x11.sh, on a private X server."""
 import json
+import struct
+import zlib
 import os
 import pathlib
 import subprocess as sp
@@ -67,6 +69,10 @@ def main():
             wait_for(lambda: run('xdotool', 'getwindowfocus').decode().strip() == popup, 'popup focus')
             hints = run('xprop', '-id', popup, '_NET_WM_STATE', '_NET_WM_WINDOW_TYPE')
             assert b'SKIP_TASKBAR' in hints and b'UTILITY' in hints
+            geometry = dict(line.split('=', 1) for line in run('xdotool', 'getwindowgeometry', '--shell', popup).decode().splitlines())
+            assert 0 <= int(geometry['X']) <= 1280 - int(geometry['WIDTH']), geometry
+            assert 0 <= int(geometry['Y']) <= 1024 - int(geometry['HEIGHT']), geometry
+
             # Type into iced's search field, then choose the only match and paste it.
             run('xdotool', 'type', '--clearmodifiers', '--delay', '5', 'original')
             time.sleep(0.25)
@@ -78,6 +84,28 @@ def main():
             pasted = base / 'data/pasted.txt'
             wait_for(lambda: pasted.exists() and pasted.read_text() == 'searchable original clip\n', 'paste reached the intended client')
             assert run('xclip', '-selection', 'clipboard', '-o') == b'searchable original clip'
+            # The global shortcut must also work with CapsLock and NumLock enabled.
+            for lock in ['Caps_Lock', 'Num_Lock']:
+                run('xdotool', 'key', lock)
+                run('xdotool', 'key', 'ctrl+grave')
+                wait_for(lambda: run('xdotool', 'getwindowfocus').decode().strip() == popup, 'global hotkey with ' + lock)
+                run('xdotool', 'key', 'Escape')
+                wait_for(lambda: run('xdotool', 'getwindowfocus').decode().strip() == target, 'hotkey focus restoration')
+                run('xdotool', 'key', lock)
+            # Capture, thumbnail, and re-serve a synthetic PNG without altering its bytes.
+            def chunk(kind, data):
+                return struct.pack('!I', len(data)) + kind + data + struct.pack('!I', zlib.crc32(kind + data))
+            png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('!2I5B', 32, 32, 8, 2, 0, 0, 0))
+            png += chunk(b'IDAT', zlib.compress((b'\0' + bytes([70, 120, 210]) * 32) * 32)) + chunk(b'IEND', b'')
+            image_source = sp.Popen(['xclip', '-selection', 'clipboard', '-target', 'image/png', '-i', '-quiet'], stdin=sp.PIPE, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            image_source.stdin.write(png); image_source.stdin.close()
+            image_clip = wait_for(lambda: next((clip for clip in cli('--list') if clip['has_image']), None), 'image capture')
+            image_source.terminate(); image_source.wait()
+            cli('--copy', str(image_clip['id']))
+            assert run('xclip', '-selection', 'clipboard', '-target', 'image/png', '-o') == png
+            cli('--show'); wait_for(lambda: run('xdotool', 'getwindowfocus').decode().strip() == popup, 'image popup')
+            time.sleep(0.1)
+            run('xdotool', 'key', 'Escape')
             # Closing settings must not quit the clipboard daemon.
             cli('--settings')
             settings = wait_for(lambda: run('xdotool', 'search', '--onlyvisible', '--name', 'feritto.*Settings').decode().strip(), 'settings window')

@@ -8,8 +8,7 @@ use iced::{
     Size, Subscription, Task, Theme,
     keyboard::{self, Key, key::Named},
     widget::{
-        self, button, checkbox, column, container, image, mouse_area, row, scrollable, space, text,
-        text_input,
+        self, button, checkbox, column, container, image, row, scrollable, space, text, text_input,
     },
     window,
 };
@@ -70,6 +69,7 @@ enum Message {
     PageReady(Result<Page, String>),
     Scroll(f32),
     Select(ClipId),
+    SearchFocused(bool),
     Accept(bool),
     Published(Result<(), String>),
     Settings,
@@ -108,6 +108,7 @@ struct App {
     generation: u64,
     ids: Arc<Vec<ClipId>>,
     selected: Option<ClipId>,
+    last_click: Option<(ClipId, Instant)>,
     offset: f32,
     page_start: usize,
     page_pending: Option<(u64, usize)>,
@@ -186,6 +187,7 @@ impl App {
             generation: 0,
             ids: Arc::new(vec![]),
             selected: None,
+            last_click: None,
             offset: 0.0,
             page_start: usize::MAX,
             page_pending: None,
@@ -296,6 +298,7 @@ impl App {
             self.target = target;
         }
         self.query.clear();
+        self.last_click = None;
         self.offset = 0.0;
         self.selected = None;
         self.pending_show = false;
@@ -529,10 +532,23 @@ impl App {
                 self.offset = offset;
                 self.load_page()
             }
+            Message::SearchFocused(focused) => {
+                self.search_focused = focused;
+                Task::none()
+            }
             Message::Select(id) => {
                 self.selected = Some(id);
                 self.search_focused = false;
-                widget::operation::focus("list-focus")
+                let double = self.last_click.is_some_and(|(old, time)| {
+                    old == id && time.elapsed() < Duration::from_millis(400)
+                });
+                self.last_click = Some((id, Instant::now()));
+                if double {
+                    self.last_click = None;
+                    self.update(Message::Accept(false))
+                } else {
+                    widget::operation::focus("list-focus")
+                }
             }
             Message::Accept(copy_only) => {
                 if self.composing {
@@ -756,6 +772,13 @@ impl App {
                 self.composing = false;
                 Task::none()
             }
+            Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
+                widget::operation::is_focused(SEARCH_ID).map(Message::SearchFocused)
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: Key::Named(Named::Tab),
+                ..
+            }) => widget::operation::is_focused(SEARCH_ID).map(Message::SearchFocused),
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 modifiers,
@@ -766,8 +789,8 @@ impl App {
                 Key::Named(Named::Enter) => self.update(Message::Accept(modifiers.shift())),
                 Key::Named(Named::ArrowDown) => self.navigate(1),
                 Key::Named(Named::ArrowUp) => self.navigate(-1),
-                Key::Named(Named::PageDown) => self.navigate(6),
-                Key::Named(Named::PageUp) => self.navigate(-6),
+                Key::Named(Named::PageDown) => self.navigate(5),
+                Key::Named(Named::PageUp) => self.navigate(-5),
                 Key::Named(Named::Home) if !self.search_focused => {
                     self.navigate(-(self.ids.len() as isize))
                 }
@@ -887,7 +910,7 @@ impl App {
                         button::text(theme, status)
                     }
                 });
-            rows = rows.push(mouse_area(entry).on_double_click(Message::Accept(false)));
+            rows = rows.push(entry);
         }
         rows = rows.push(space().height((self.ids.len() - end) as f32 * ROW));
         let list: Element<'_, Message> = if self.ids.is_empty() {
@@ -976,7 +999,14 @@ impl App {
                     .content_fit(iced::ContentFit::Contain),
             );
         }
-        content = content.push(scrollable(text(&summary.preview).size(13)).height(Fill));
+        content = content.push(
+            scrollable(
+                text(&summary.preview)
+                    .size(13)
+                    .shaping(widget::text::Shaping::Advanced),
+            )
+            .height(Fill),
+        );
         if summary.search_truncated {
             content =
                 content.push(text("Search covers the first 64 KiB of normalized text.").size(11));

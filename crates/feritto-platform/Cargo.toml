@@ -2,6 +2,7 @@
 name = "feritto-platform"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -10,3 +11,4 @@ anyhow.workspace = true
 crossbeam-channel.workspace = true
 x11rb.workspace = true
 tracing.workspace = true
+rustix = { version = "1", features = ["event"] }

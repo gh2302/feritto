@@ -704,6 +704,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "feritto-core",
+ "rustix 1.1.6",
  "tracing",
  "x11rb",
 ]
