@@ -1,7 +1,8 @@
 # Ditto → Rust + iced porting plan
 
-Prepared: 2026-11-03. Status: proposed implementation plan; no application code
-exists in this repository yet.
+Prepared: 2026-11-03. Status: implementation started; a runnable X11 foundation
+is now checked in. See [implementation evidence and remaining gates](x11-implementation.md).
+The milestones below remain qualification gates, not completed-release claims.
 
 Critically reviewed in an independent read-only pass; the corrections and remaining feasibility
 decisions are recorded in [the review resolutions](ditto-rust-iced-review.md).

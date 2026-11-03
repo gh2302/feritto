@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=feritto
+GenericName=Clipboard Manager
+Comment=Search and reuse your clipboard history
+Exec=feritto --show
+Icon=io.github.gh2302.Feritto
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;history;ditto;
+StartupWMClass=io.github.gh2302.Feritto
+Actions=Settings;Quit;
+
+[Desktop Action Settings]
+Name=Settings
+Exec=feritto --settings
+
+[Desktop Action Quit]
+Name=Quit
+Exec=feritto --quit

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# These commands create private native X11 servers, even when invoked from Wayland.
+export XDG_SESSION_TYPE=x11
+unset WAYLAND_DISPLAY
 cargo build --locked -p feritto
 xvfb-run -a cargo test --locked -p feritto-platform --test x11_protocol -- --ignored
 for wm in i3 xfwm4; do

@@ -29,6 +29,9 @@ def wait_for(predicate, label, seconds=8):
     raise AssertionError('Timed out: ' + label)
 
 def main():
+    # The caller supplies an isolated native X11 server.
+    os.environ.pop('WAYLAND_DISPLAY', None)
+    os.environ['XDG_SESSION_TYPE'] = 'x11'
     wm_name = sys.argv[1] if len(sys.argv) > 1 else 'i3'
     with tempfile.TemporaryDirectory(prefix='feritto-smoke-') as directory:
         base = pathlib.Path(directory)
