@@ -1,0 +1,37 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+crossbeam-channel = "0.5"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+thiserror = "2.0"
+unicode-normalization = "0.1"
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+tempfile = "3"
+x11rb = { version = "0.13", features = ["xfixes", "xtest", "randr", "xkb"] }
+iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "x11", "tokio", "image-without-codecs", "advanced"] }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+feritto-core = { path = "crates/feritto-core" }
+feritto-store = { path = "crates/feritto-store" }
+feritto-platform = { path = "crates/feritto-platform" }
+feritto-ui = { path = "crates/feritto-ui" }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,10 @@
+feritto is an independent Rust implementation of a Ditto-style clipboard manager.
+New application code is licensed under GPL-3.0-or-later (see LICENSE).
+
+Ditto: https://github.com/sabrogden/Ditto
+Reference revision: a80fd3536bc407cac8cce43b5682022282ace983
+Copyright belongs to the Ditto contributors; Ditto is distributed under GPLv3.
+The design documents describe behavior and schema compatibility. No upstream
+C++ code, Windows binaries, or Ditto artwork has been copied into this application.
+Existing project artwork in assets/icon.svg predates this implementation.
+Third-party Rust dependencies retain their own licenses.

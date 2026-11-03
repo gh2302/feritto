@@ -1,0 +1,21 @@
+[package]
+name = "feritto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+wgpu = ["feritto-ui/wgpu"]
+
+[dependencies]
+feritto-core.workspace = true
+feritto-store.workspace = true
+feritto-platform.workspace = true
+feritto-ui.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ksni = "0.3"
