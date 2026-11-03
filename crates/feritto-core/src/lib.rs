@@ -160,7 +160,7 @@ pub enum PasteShortcut {
     ShiftInsert,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CapturePolicy {
     pub text: bool,

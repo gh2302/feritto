@@ -170,9 +170,10 @@ impl Repository {
                 .map(|r| String::from_utf8_lossy(&r.bytes).into_owned())
                 .unwrap_or_default()
         });
-        let normalized = normalize_search(&text);
+        let prefix = bounded_text(&text, SEARCH_LIMIT);
+        let normalized = normalize_search(&prefix);
         let search = bounded_text(&normalized, SEARCH_LIMIT);
-        let truncated = search.len() < normalized.len();
+        let truncated = prefix.len() < text.len() || search.len() < normalized.len();
         let has_image = offer
             .representations
             .iter()

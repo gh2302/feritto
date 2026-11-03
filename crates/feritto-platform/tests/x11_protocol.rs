@@ -127,6 +127,33 @@ fn capture_serve_large_persist_clear_and_secret() -> Result<()> {
             .value,
         b"history selection"
     );
+    // Explicit paste publishes PRIMARY independently. A later CLIPBOARD copy must leave it intact.
+    service
+        .paste(
+            Arc::new(Offer::text("primary selection")),
+            PasteTarget::default(),
+            PasteShortcut::ShiftInsert,
+        )
+        .unwrap();
+    service
+        .publish(Arc::new(Offer::text("new clipboard selection")))
+        .unwrap();
+    assert_eq!(
+        Command::new("xclip")
+            .args(["-selection", "primary", "-o"])
+            .output()?
+            .stdout,
+        b"primary selection"
+    );
+    wait_text(b"new clipboard selection");
+    service.clear().unwrap();
+    assert_eq!(
+        Command::new("xclip")
+            .args(["-selection", "primary", "-o"])
+            .output()?
+            .stdout,
+        b"primary selection"
+    );
     // A secret generation must not be fetched, persisted, or restore the previous clip.
     let secret = atom(b"x-kde-passwordManagerHint");
     let targets = atom(b"TARGETS");

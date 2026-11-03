@@ -218,6 +218,7 @@ struct Worker {
     incoming: Option<Incoming>,
     saved: Option<Saved>,
     published: Option<Published>,
+    primary_published: Option<Published>,
     outgoing: Vec<Outgoing>,
     paste: Option<PendingPaste>,
     owner: Window,
@@ -308,6 +309,7 @@ impl Worker {
             incoming: None,
             saved: None,
             published: None,
+            primary_published: None,
             outgoing: vec![],
             paste: None,
             owner,
@@ -380,7 +382,8 @@ impl Worker {
                 );
                 let success = result.is_ok();
                 let _ = reply.send(result.map_err(|e| e.to_string()));
-                if success && let Some((target, shortcut)) = paste {
+                if success && let Some((mut target, shortcut)) = paste {
+                    target.timestamp = self.timestamp;
                     if let Err(error) = self.request_focus(target.window, target.timestamp) {
                         self.emit(PlatformEvent::PasteResult(format!(
                             "Copied; press your paste shortcut ({error})"
@@ -414,20 +417,41 @@ impl Worker {
                 }
             }
             Command::Settings(settings) => {
-                if settings.paused
-                    || settings.capture.extra_targets != self.settings.capture.extra_targets
-                {
+                if settings.paused || settings.capture != self.settings.capture {
                     self.cancel_incoming();
                     self.saved = None;
                 }
-                if settings.coexistence && self.manager {
+                let manager = self
+                    .conn
+                    .get_selection_owner(self.atoms.CLIPBOARD_MANAGER)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|r| r.owner);
+                if settings.coexistence && manager == Some(self.window) {
                     let _ = self.conn.set_selection_owner(
                         NONE,
                         self.atoms.CLIPBOARD_MANAGER,
                         CURRENT_TIME,
                     );
                     self.manager = false;
+                } else if !settings.coexistence
+                    && manager == Some(NONE)
+                    && let Ok(cookie) = self.conn.set_selection_owner(
+                        self.window,
+                        self.atoms.CLIPBOARD_MANAGER,
+                        CURRENT_TIME,
+                    )
+                {
+                    self.manager = cookie.check().is_ok();
                 }
+                self.capabilities.persistence = if self.manager {
+                    Capability::Available
+                } else {
+                    Capability::Unavailable(
+                        "Another manager or history-only mode disables recovery".into(),
+                    )
+                };
+                self.update_capabilities();
                 self.settings = settings;
             }
             Command::Active(reply) => {
@@ -489,6 +513,7 @@ impl Worker {
         if e.owner == self.window {
             return Ok(());
         }
+        self.published = None;
         let destruction = e.subtype == xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY
             || e.subtype == xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE;
         if e.owner == NONE && destruction {
@@ -502,18 +527,22 @@ impl Worker {
             {
                 // A server grab makes the owner check + timestamped claim atomic against a new copy.
                 self.conn.grab_server()?.check()?;
-                let unowned = self
-                    .conn
-                    .get_selection_owner(self.atoms.CLIPBOARD)?
-                    .reply()?
-                    .owner
-                    == NONE;
-                if unowned {
-                    self.conn
-                        .set_selection_owner(self.window, self.atoms.CLIPBOARD, e.timestamp)?
-                        .check()?;
-                }
+                let claim = (|| -> Result<bool> {
+                    let unowned = self
+                        .conn
+                        .get_selection_owner(self.atoms.CLIPBOARD)?
+                        .reply()?
+                        .owner
+                        == NONE;
+                    if unowned {
+                        self.conn
+                            .set_selection_owner(self.window, self.atoms.CLIPBOARD, e.timestamp)?
+                            .check()?;
+                    }
+                    Ok(unowned)
+                })();
                 self.conn.ungrab_server()?.check()?;
+                let unowned = claim?;
                 if unowned
                     && self
                         .conn
@@ -1038,6 +1067,7 @@ impl Worker {
             .set_selection_owner(self.window, self.atoms.CLIPBOARD, timestamp)?
             .check()?;
         if primary {
+            self.primary_published = self.published.clone();
             self.conn
                 .set_selection_owner(self.window, AtomEnum::PRIMARY.into(), timestamp)?
                 .check()?;
@@ -1101,7 +1131,12 @@ impl Worker {
             self.notify(e, NONE)?;
             return Ok(());
         }
-        let Some(published) = self.published.clone() else {
+        let offer = if e.selection == u32::from(AtomEnum::PRIMARY) {
+            &self.primary_published
+        } else {
+            &self.published
+        };
+        let Some(published) = offer.clone() else {
             self.notify(e, NONE)?;
             return Ok(());
         };
@@ -1364,6 +1399,17 @@ impl Worker {
     }
     fn prepare(&mut self, window: Window, width: u32, height: u32) -> Result<()> {
         self.popup = window;
+        let geometry = self.conn.get_geometry(window)?.reply()?;
+        let width = if geometry.width > 0 {
+            u32::from(geometry.width)
+        } else {
+            width
+        };
+        let height = if geometry.height > 0 {
+            u32::from(geometry.height)
+        } else {
+            height
+        };
         self.conn
             .change_property32(
                 PropMode::REPLACE,
