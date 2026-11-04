@@ -43,7 +43,7 @@ jobs:
           echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
-          shellcheck scripts/package.sh scripts/check-package.sh
+          shellcheck scripts/package.sh scripts/check-package.sh scripts/check-deb-install.sh
       - name: Check formatting, Clippy and optional GPU build
         run: make check
 
@@ -122,10 +122,32 @@ jobs:
           retention-days: 14
           compression-level: 0
 
+  deb-install:
+    name: Debian/Ubuntu installation (${{ matrix.image }})
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:24.04, debian:13-slim]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: feritto-linux-x86_64
+          path: dist
+      - name: Install, reinstall, remove and purge in a clean distribution
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+        run: make test-deb-install DEB_TEST_IMAGES="$TEST_IMAGE"
+
   required:
     name: Required checks
     if: always()
-    needs: [quality, test, desktop, package]
+    needs: [quality, test, desktop, package, deb-install]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

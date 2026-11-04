@@ -55,10 +55,13 @@ committed `Cargo.lock` with `--locked`:
 | Desktop (x11) | Isolated Xvfb protocol tests and i3/Xfwm smoke tests against the packaged release binary |
 | Desktop (wayland) | Private headless sway protocol tests and smoke tests against the packaged release binary |
 | Linux release packages | Optimized binary, archive and Debian package, checksums, payload comparison, desktop launcher validation, headless CLI checks |
+| Debian/Ubuntu installation | APT install, reinstall, remove and purge on Ubuntu 24.04 and Debian 13 containers, installed-file verification and user-data preservation |
 | Required checks | Requires every preceding job to succeed |
 
 The desktop jobs download and verify the package artifact rather than rebuilding
 the application, so the binary exercised by smoke tests is the one published.
+The Debian/Ubuntu jobs install that same `.deb` in clean containers, resolving
+runtime dependencies from each distribution's repositories.
 Jobs have explicit timeouts. Desktop matrix entries both finish even if one
 fails. Superseded branch/PR runs are cancelled, while release runs are not.
 Only pushes to the default branch can save Rust caches. Action dependencies are
@@ -129,7 +132,7 @@ cp -a feritto-0.1.0-linux-x86_64/. "$HOME/.local/"
 ```
 
 Ensure `~/.local/bin` is on the desktop session's `PATH`. Both formats include
-the desktop launcher, icon, license, notice, README, and an optional autostart
+the desktop launcher, icon, license, notice, README, manual page, and an optional autostart
 desktop file under `share/doc/feritto/`. Neither enables autostart automatically,
 starts the service during installation, or changes clipboard/history data.
 
@@ -154,3 +157,9 @@ Python 3.11 or newer is required for its standard-library TOML parser. Override
 directory. `SOURCE_DATE_EPOCH` defaults to the last commit timestamp and controls
 package timestamps. Packages built locally inherit the local distribution's
 linked-library requirements.
+
+Use `make deb && make test-deb` to build and validate only the `.deb`.
+`make test-deb-install` additionally uses Docker to test installation,
+reinstallation, removal and purge on Ubuntu 24.04 and Debian 13. See
+[Debian/Ubuntu distribution](debian-ubuntu.md) for the complete installation,
+upgrade, removal and local-build guide.

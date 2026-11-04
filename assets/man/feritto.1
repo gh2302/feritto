@@ -1,0 +1,94 @@
+.TH FERITTO 1 "2026-11-03" "feritto" "User Commands"
+.SH NAME
+feritto \- native X11 and Wayland clipboard history manager
+.SH SYNOPSIS
+.B feritto
+.RI [ OPTION ]
+.SH DESCRIPTION
+feritto captures clipboard history and provides a searchable desktop popup.
+It supports text, PNG images, HTML, RTF and file lists.
+The service runs as the logged-in desktop user and keeps running when the popup
+is hidden. With no option, feritto starts or shows the popup.
+.PP
+Run feritto from an X11 or Wayland desktop session, not as root.
+Wayland capture requires a compositor implementing ext-data-control-v1 or
+wlr-data-control. GNOME Wayland does not provide these protocols.
+.SH OPTIONS
+.TP
+.B \-\-daemon
+Start with the popup hidden.
+.TP
+.B \-\-show
+Show the popup.
+.TP
+.B \-\-toggle
+Toggle the popup. The default X11 shortcut is Ctrl+grave.
+On Wayland, configure a compositor shortcut if no GlobalShortcuts portal exists.
+.TP
+.B \-\-hide
+Hide the popup.
+.TP
+.B \-\-settings
+Open settings.
+.TP
+.B \-\-pause
+Toggle capture pause.
+.TP
+.B \-\-status
+Print capabilities and history count as JSON.
+.TP
+.BR \-\-list " [" \-\-search " " QUERY ]
+List up to 1000 clip summaries as JSON, optionally filtered by a search query.
+.TP
+.BI \-\-copy " ID"
+Put a historical clip on the clipboard.
+.TP
+.BI \-\-paste " ID"
+Copy a historical clip and request paste into the active window.
+.TP
+.BI \-\-add " TEXT"
+Add a text clip to history.
+.TP
+.B \-\-add-stdin
+Add UTF-8 text from standard input, up to 32 MiB.
+.TP
+.BI \-\-delete " ID"
+Delete one history entry.
+.TP
+.B \-\-clear-history
+Delete all history and keep the current clipboard.
+.TP
+.B \-\-clear-clipboard
+Clear the clipboard and keep history.
+.TP
+.B \-\-quit
+Stop the service.
+.TP
+.BR \-\-help ", " \-h
+Show command-line help.
+.TP
+.BR \-\-version ", " \-V
+Print the version.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/feritto
+Unencrypted clipboard history. Defaults to ~/.local/share/feritto.
+.TP
+.I $XDG_CONFIG_HOME/feritto/settings.json
+Settings. Defaults to ~/.config/feritto/settings.json.
+.TP
+.I $XDG_RUNTIME_DIR/feritto
+Per-user instance socket. Without XDG_RUNTIME_DIR, a private directory under
+/tmp is used.
+.TP
+.I /usr/share/doc/feritto/io.github.gh2302.Feritto-autostart.desktop
+Optional autostart example. Copy into ~/.config/autostart/ to enable it.
+Package installation does not enable autostart or start the application.
+.SH PRIVACY
+History is unencrypted. Pause capture before copying sensitive content.
+Deleting history is logical deletion, not secure erasure of backups or
+filesystem snapshots.
+Removing the package leaves user history and settings intact.
+.SH SEE ALSO
+.IR /usr/share/doc/feritto/README.md ,
+.I /usr/share/doc/feritto/README.Debian

@@ -93,6 +93,24 @@ lists all commands. `--list` returns at most 1,000 summaries; the UI supports a
 
 ## Install
 
+### Debian / Ubuntu package
+
+Download the `.deb` and `SHA256SUMS` from a GitHub Release, verify the checksum,
+then install with APT (amd64; Ubuntu 24.04 and Debian 13):
+
+```sh
+sha256sum --ignore-missing --check SHA256SUMS
+sudo apt install ./feritto_0.1.0_amd64.deb
+```
+
+Launch **feritto** from your application menu or run `feritto` in your desktop
+session. Installation does not start capture or enable autostart. Use
+`sudo apt remove feritto` to uninstall; your history and settings are preserved.
+See [Debian/Ubuntu distribution](docs/debian-ubuntu.md) for upgrades, autostart,
+local builds, compatibility, and clean-container installation tests.
+
+### Build and install per user
+
 `make install` builds a release binary and installs it, the desktop launcher,
 and the icon under `~/.local`. Override `PREFIX` and `DESTDIR` for packaging.
 Ensure `~/.local/bin` is on your desktop's PATH. `make uninstall` removes those
@@ -113,8 +131,11 @@ those exact packages and `SHA256SUMS` to GitHub Releases only after every check
 passes. The tag must match the workspace version and point to a commit already
 on the default branch. No external deployment service or personal token is needed.
 
-Build packages locally with `make package && make test-package` (requires
+Build just the Debian/Ubuntu package with `make deb && make test-deb`, or both
+formats with `make package && make test-package` (requires
 `dpkg-dev`, `desktop-file-utils`, and Python 3.11+). Outputs go to `dist/`.
+`make test-deb-install` tests APT installation, reinstallation, removal and purge
+on clean Ubuntu and Debian containers using Docker.
 See [GitHub setup and release instructions](docs/github.md) for repository
 protection settings, installation commands, and the release procedure.
 
