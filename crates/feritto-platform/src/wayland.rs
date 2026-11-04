@@ -13,7 +13,10 @@
 //! back to Xwayland, which cannot observe or paste into native Wayland clients.
 use crate::{
     PlatformEvent, PlatformOptions, RawDisplayHandle, RawWindowHandle,
-    portal::{self, APP_ID, PasteAccess, PortalOptions, PortalRequest, PortalUpdate},
+    portal::{
+        self, APP_ID, InjectError, PASTE_SUPERSEDED, PasteAccess, PasteGuard, PortalOptions,
+        PortalRequest, PortalUpdate, Publications,
+    },
 };
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -82,6 +85,14 @@ const TEXT_TARGETS: [&str; 5] = [
     "TEXT",
 ];
 const MAX_OUTGOING: usize = 32;
+/// Offers announcing more types than this are not captured. The types that would be dropped
+/// could include a password-manager or ignore hint, so a truncated list is never trusted.
+const MAX_OFFER_TYPES: usize = 512;
+/// How long a paste handed to the portal thread may wait there before it is abandoned.
+const INJECT_DEADLINE: Duration = Duration::from_millis(500);
+/// Reads for feritto's own text fields happen on the GUI thread and must stay short.
+const FIELD_READ_TIMEOUT: Duration = Duration::from_millis(1000);
+const MAX_FIELD_TEXT: usize = 1024 * 1024;
 const PASTE_CONFIRM: Duration = Duration::from_millis(1000);
 /// Without a toplevel list, give the compositor time to refocus the previous window.
 const PASTE_SETTLE: Duration = Duration::from_millis(250);
@@ -178,9 +189,17 @@ enum Command {
     Pause(bool),
     Active(Sender<ServiceResult<PasteTarget>>),
     Restore(PasteTarget),
-    Text(Sender<ServiceResult<String>>),
+    Text(Sender<ServiceResult<TextRead>>),
     Portal(PortalUpdate),
     Shutdown(Sender<()>),
+}
+
+/// Clipboard text for feritto's own text fields.
+enum TextRead {
+    /// feritto serves the clipboard itself.
+    Ready(String),
+    /// The read end of a transfer from the current selection owner.
+    Pipe(OwnedFd),
 }
 
 #[derive(Clone)]
@@ -209,7 +228,6 @@ impl ServiceSender {
 pub struct WaylandService {
     tx: ServiceSender,
     capabilities: Arc<Mutex<Capabilities>>,
-    activation: Arc<Mutex<Option<String>>>,
     portal: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<PortalRequest>>>>,
 }
 
@@ -227,13 +245,7 @@ impl WaylandService {
             wake: Arc::new(wake),
         };
         let (events_tx, events_rx) = bounded(64);
-        // A launcher may start the service with a token for its first window.
-        let activation = Arc::new(Mutex::new(
-            std::env::var("XDG_ACTIVATION_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty()),
-        ));
-        let mut worker = Worker::connect(settings, events_tx, activation.clone())?;
+        let mut worker = Worker::connect(settings, events_tx)?;
         let capabilities = Arc::new(Mutex::new(worker.state.capabilities.clone()));
         worker.state.shared = Some(capabilities.clone());
         let portal = Arc::new(Mutex::new(None));
@@ -285,7 +297,6 @@ impl WaylandService {
             Self {
                 tx,
                 capabilities,
-                activation,
                 portal,
             },
             events_rx,
@@ -298,11 +309,19 @@ impl WaylandService {
         &self,
         make: impl FnOnce(Sender<ServiceResult<T>>) -> Command,
     ) -> ServiceResult<T> {
+        self.request_within(make, Duration::from_secs(2), Duration::from_secs(3))
+    }
+    fn request_within<T>(
+        &self,
+        make: impl FnOnce(Sender<ServiceResult<T>>) -> Command,
+        queue: Duration,
+        reply: Duration,
+    ) -> ServiceResult<T> {
         let (tx, rx) = bounded(1);
         self.tx
-            .send_timeout(make(tx), Duration::from_secs(2))
+            .send_timeout(make(tx), queue)
             .map_err(|_| "Wayland worker unavailable".to_string())?;
-        rx.recv_timeout(Duration::from_secs(3))
+        rx.recv_timeout(reply)
             .map_err(|_| "Wayland operation timed out".to_string())?
     }
     pub fn configure(&self, settings: Settings) {
@@ -317,28 +336,18 @@ impl WaylandService {
             let _ = rx.recv_timeout(Duration::from_secs(2));
         }
     }
-    pub fn set_activation_token(&self, token: Option<String>) {
-        if let Some(token) = token.filter(|t| !t.is_empty()) {
-            *self.activation.lock().unwrap() = Some(token);
-        }
-    }
-    /// Uses (and consumes) a pending activation token for a newly opened window. Returns
-    /// whether a token was used; without one the compositor applies its own focus policy.
-    pub fn activate_window(
-        &self,
-        display: RawDisplayHandle,
-        window: RawWindowHandle,
-    ) -> ServiceResult<bool> {
-        let Some(token) = self.activation.lock().unwrap().take() else {
-            return Ok(false);
-        };
-        activate_surface(display, window, &token).map_err(|e| format!("{e:#}"))?;
-        Ok(true)
-    }
-    /// Text of the current clipboard when feritto owns it or has fully captured it. The GUI
-    /// has no Wayland clipboard of its own, so its search field pastes through this.
+    /// Text of the current clipboard, read from the selection owner like any paste. The GUI
+    /// has no Wayland clipboard of its own, so its text fields read through this; it works
+    /// regardless of history capture, pause, or format settings.
     pub fn clipboard_text(&self) -> ServiceResult<String> {
-        self.request(Command::Text)
+        let started = Instant::now();
+        let read = self.request_within(Command::Text, FIELD_READ_TIMEOUT, FIELD_READ_TIMEOUT)?;
+        match read {
+            TextRead::Ready(text) => Ok(text),
+            TextRead::Pipe(pipe) => {
+                read_field_text(pipe, started + FIELD_READ_TIMEOUT).map_err(|e| format!("{e:#}"))
+            }
+        }
     }
     pub fn request_paste_permission(&self) -> ServiceResult<()> {
         let portal = self.portal.lock().unwrap();
@@ -383,6 +392,43 @@ impl ActiveWindowTracker for WaylandService {
     fn active_window(&self) -> ServiceResult<PasteTarget> {
         self.request(Command::Active)
     }
+}
+
+/// Reads a text transfer for a text field, bounded in time and size.
+fn read_field_text(pipe: OwnedFd, deadline: Instant) -> Result<String> {
+    rustix::io::ioctl_fionbio(&pipe, true)?;
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match rustix::io::read(&pipe, &mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes.extend_from_slice(&buffer[..n]);
+                if bytes.len() > MAX_FIELD_TEXT {
+                    bail!("the clipboard text is too long to paste here");
+                }
+            }
+            Err(Errno::AGAIN) => {
+                let left = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| {
+                        anyhow!("the application that owns the clipboard did not respond")
+                    })?;
+                let timeout = rustix::event::Timespec {
+                    tv_sec: left.as_secs() as _,
+                    tv_nsec: left.subsec_nanos() as _,
+                };
+                let mut fds = [rustix::event::PollFd::new(&pipe, PollFlags::IN)];
+                match rustix::event::poll(&mut fds, Some(&timeout)) {
+                    Ok(_) | Err(Errno::INTR) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -482,6 +528,8 @@ impl DataOffer {
 struct OfferInfo {
     offer: DataOffer,
     mimes: Vec<String>,
+    /// More than MAX_OFFER_TYPES types were announced; `mimes` is incomplete.
+    overflow: bool,
 }
 
 struct Published {
@@ -554,6 +602,8 @@ struct PendingPaste {
     started: Instant,
     /// Clients learn about a new keyboard device asynchronously; keys sent before that are lost.
     not_before: Instant,
+    /// The publication this paste was requested for; keys are never sent for a later one.
+    guard: PasteGuard,
 }
 
 struct State {
@@ -584,10 +634,11 @@ struct State {
     expect_clear: bool,
     contention: VecDeque<Instant>,
     paste: Option<PendingPaste>,
+    /// Advances whenever the CLIPBOARD or PRIMARY contents feritto serves change or end.
+    publications: Arc<Publications>,
     portal: Option<tokio::sync::mpsc::UnboundedSender<PortalRequest>>,
     hotkey: Capability,
     paste_access: PasteAccess,
-    activation: Arc<Mutex<Option<String>>>,
     capabilities: Capabilities,
     shared: Option<Arc<Mutex<Capabilities>>>,
     clock: Instant,
@@ -600,11 +651,7 @@ struct Worker {
 }
 
 impl Worker {
-    fn connect(
-        settings: Settings,
-        events: Sender<PlatformEvent>,
-        activation: Arc<Mutex<Option<String>>>,
-    ) -> Result<Self> {
+    fn connect(settings: Settings, events: Sender<PlatformEvent>) -> Result<Self> {
         let conn = Connection::connect_to_env().context("cannot connect to the Wayland display")?;
         let (globals, mut queue) =
             registry_queue_init::<State>(&conn).context("cannot read Wayland globals")?;
@@ -653,12 +700,10 @@ impl Worker {
             expect_clear: false,
             contention: VecDeque::new(),
             paste: None,
+            publications: Arc::default(),
             portal: None,
-            hotkey: Capability::PermissionRequired(
-                "waiting for the desktop's GlobalShortcuts portal".into(),
-            ),
-            paste_access: PasteAccess::Unavailable("waiting for the desktop portal".into()),
-            activation,
+            hotkey: Capability::Pending("waiting for the desktop's GlobalShortcuts portal".into()),
+            paste_access: PasteAccess::Pending("waiting for the desktop portal".into()),
             capabilities: Capabilities {
                 backend: "Wayland".into(),
                 monitor: Capability::Unavailable(String::new()),
@@ -809,11 +854,7 @@ impl Worker {
             }
             Command::Restore(target) => self.state.restore(target),
             Command::Text(reply) => {
-                let _ = reply.send(
-                    self.state
-                        .current_text()
-                        .ok_or_else(|| "The clipboard holds no captured text".to_string()),
-                );
+                let _ = reply.send(self.state.read_text().map_err(|e| format!("{e:#}")));
             }
             Command::Portal(update) => self.state.portal_update(update),
             Command::Shutdown(_) => {}
@@ -886,6 +927,7 @@ impl State {
             PasteAccess::PermissionRequired(reason) => {
                 Capability::PermissionRequired(reason.clone())
             }
+            PasteAccess::Pending(reason) => Capability::Pending(reason.clone()),
             PasteAccess::Ready if self.device.is_none() => no_control(),
             PasteAccess::Ready if !tracking && !self.settings.unverified_paste => {
                 Capability::Unavailable(
@@ -956,18 +998,20 @@ impl State {
                     self.update_capabilities();
                 }
             }
+            // Also refreshes an open Settings window, which shows the new capability.
+            PortalUpdate::Status(status) => self.emit(PlatformEvent::Status(status)),
             PortalUpdate::Activated(token) => {
-                if let Some(token) = token {
-                    *self.activation.lock().unwrap() = Some(token);
-                }
-                self.emit(PlatformEvent::Toggle(self.target()));
+                self.emit(PlatformEvent::Toggle(self.target(), token));
             }
             PortalUpdate::Injected(Ok(())) => {
                 self.emit(PlatformEvent::PasteResult(
                     "Pasted into the previous window".into(),
                 ));
             }
-            PortalUpdate::Injected(Err(error)) => {
+            PortalUpdate::Injected(Err(InjectError::Stale(status))) => {
+                self.emit(PlatformEvent::PasteResult(status));
+            }
+            PortalUpdate::Injected(Err(InjectError::Failed(error))) => {
                 self.emit(PlatformEvent::PasteResult(format!(
                     "Copied; press your paste shortcut ({error})"
                 )));
@@ -1008,6 +1052,11 @@ impl State {
             return;
         };
         if info.mimes.contains(&self.marker) {
+            return;
+        }
+        if info.overflow {
+            // Like X11's oversized TARGETS lists: hints may hide in the unread part.
+            tracing::debug!("clipboard offer announced too many types; not captured");
             return;
         }
         if self.settings.paused
@@ -1283,15 +1332,20 @@ impl State {
         }
         let data = Arc::new(served_formats(offer)?);
         let published = self.create_published(&data)?;
-        let device = self.device.as_ref().unwrap();
         // Replaced sources are destroyed rather than cancelled, so they never look like
         // contention with another manager.
+        let primary = primary && self.primary_supported;
+        // From here on the old contents are being replaced; a paste waiting for them is void.
+        self.supersede(true, primary);
         if let Some(old) = self.published.take() {
             old.source.destroy();
         }
-        device.set_selection(Some(&published.source), false);
+        self.device
+            .as_ref()
+            .unwrap()
+            .set_selection(Some(&published.source), false);
         self.published = Some(published);
-        if primary && self.primary_supported {
+        if primary {
             let published = self.create_published(&data)?;
             if let Some(old) = self.primary_published.take() {
                 old.source.destroy();
@@ -1314,6 +1368,7 @@ impl State {
         }
         self.cancel_incoming();
         self.saved = None;
+        self.supersede(true, false);
         if let Some(old) = self.published.take() {
             old.source.destroy();
         }
@@ -1378,6 +1433,7 @@ impl State {
         {
             let old = self.primary_published.take().unwrap();
             old.source.destroy();
+            self.supersede(false, true);
             return;
         }
         if !self
@@ -1389,6 +1445,7 @@ impl State {
         }
         let old = self.published.take().unwrap();
         old.source.destroy();
+        self.supersede(true, false);
         // Another client replaced our selection. Repeated takeovers within a short window mean
         // another manager is fighting for ownership; stop recovering to end the loop.
         let now = Instant::now();
@@ -1434,17 +1491,43 @@ impl State {
         }
     }
 
-    fn current_text(&self) -> Option<String> {
+    /// Starts a text read for feritto's own text fields. The caller reads the pipe, so a slow
+    /// selection owner never blocks this worker.
+    fn read_text(&self) -> Result<TextRead> {
         if let Some(published) = &self.published {
-            return published
+            let bytes = published
                 .data
                 .get(TEXT_TARGETS[0])
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+                .ok_or_else(|| anyhow!("the clipboard holds no text"))?;
+            return Ok(TextRead::Ready(String::from_utf8_lossy(bytes).into_owned()));
         }
-        self.saved
+        let info = self
+            .clipboard_offer
             .as_ref()
-            .filter(|saved| saved.generation == self.generation)
-            .and_then(|saved| saved.offer.text_content())
+            .and_then(|id| self.offers.get(id))
+            .ok_or_else(|| anyhow!("the clipboard is empty"))?;
+        let mime = TEXT_TARGETS
+            .into_iter()
+            .find(|name| info.mimes.iter().any(|m| m == name))
+            .ok_or_else(|| anyhow!("the clipboard holds no text"))?;
+        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        info.offer.receive(mime.to_owned(), write.as_fd());
+        Ok(TextRead::Pipe(read))
+    }
+
+    /// Records that the CLIPBOARD and/or PRIMARY contents feritto served were replaced or
+    /// ended. A paste requested for the old contents is cancelled rather than allowed to send
+    /// keys that would paste whatever replaced them; the portal thread sees the same change.
+    fn supersede(&mut self, clipboard: bool, primary: bool) {
+        self.publications.advance(clipboard, primary);
+        if self
+            .paste
+            .as_ref()
+            .is_some_and(|p| p.guard.check().is_err())
+        {
+            self.paste = None;
+            self.emit(PlatformEvent::PasteResult(PASTE_SUPERSEDED.into()));
+        }
     }
 
     fn restore(&mut self, target: PasteTarget) {
@@ -1457,9 +1540,9 @@ impl State {
         let name = shortcut_name(shortcut);
         let reason = match &self.paste_access {
             PasteAccess::Ready => None,
-            PasteAccess::PermissionRequired(reason) | PasteAccess::Unavailable(reason) => {
-                Some(reason.clone())
-            }
+            PasteAccess::PermissionRequired(reason)
+            | PasteAccess::Pending(reason)
+            | PasteAccess::Unavailable(reason) => Some(reason.clone()),
         };
         if let Some(reason) = reason {
             self.emit(PlatformEvent::PasteResult(format!(
@@ -1494,6 +1577,10 @@ impl State {
             verify,
             started: now,
             not_before,
+            guard: PasteGuard::new(
+                &self.publications,
+                matches!(shortcut, PasteShortcut::ShiftInsert),
+            ),
         });
     }
 
@@ -1502,7 +1589,10 @@ impl State {
         let paste = self.paste.as_ref()?;
         let name = shortcut_name(paste.shortcut);
         if self.published.is_none() {
-            return Some("Clipboard changed before paste; no keys were sent".into());
+            return Some(PASTE_SUPERSEDED.into());
+        }
+        if let Err(status) = paste.guard.check() {
+            return Some(status);
         }
         if now < paste.not_before {
             return None;
@@ -1516,7 +1606,8 @@ impl State {
         };
         if ready {
             let shortcut = paste.shortcut;
-            return match self.inject(shortcut) {
+            let guard = paste.guard.clone().until(now + INJECT_DEADLINE);
+            return match self.inject(shortcut, guard) {
                 Ok(Injected::Sent) => Some("Pasted into the previous window".into()),
                 Ok(Injected::Pending) => {
                     // The portal thread reports the result; stop tracking the paste here.
@@ -1534,7 +1625,7 @@ impl State {
         None
     }
 
-    fn inject(&mut self, shortcut: PasteShortcut) -> Result<Injected> {
+    fn inject(&mut self, shortcut: PasteShortcut, guard: PasteGuard) -> Result<Injected> {
         let (mask, modifiers, code, keysym) = shortcut_keys(shortcut);
         if self.vk_manager.is_some() {
             let time = self.clock.elapsed().as_millis() as u32;
@@ -1553,6 +1644,7 @@ impl State {
             .send(PortalRequest::Inject {
                 modifiers,
                 key: keysym,
+                guard,
             })
             .map_err(|_| anyhow!("the desktop portal stopped"))?;
         Ok(Injected::Pending)
@@ -1657,6 +1749,7 @@ macro_rules! data_control_dispatch {
                             OfferInfo {
                                 offer: DataOffer::$Wrap(id),
                                 mimes: vec![],
+                                overflow: false,
                             },
                         );
                     }
@@ -1668,6 +1761,7 @@ macro_rules! data_control_dispatch {
                         state.device = None;
                         state.published = None;
                         state.primary_published = None;
+                        state.supersede(true, true);
                         state.cancel_incoming();
                         state.update_capabilities();
                         state.emit(PlatformEvent::Status(
@@ -1693,9 +1787,12 @@ macro_rules! data_control_dispatch {
             ) {
                 if let $offer::Event::Offer { mime_type } = event
                     && let Some(info) = state.offers.get_mut(&offer.id())
-                    && info.mimes.len() < 512
                 {
-                    info.mimes.push(mime_type);
+                    if info.mimes.len() < MAX_OFFER_TYPES {
+                        info.mimes.push(mime_type);
+                    } else {
+                        info.overflow = true;
+                    }
                 }
             }
         }

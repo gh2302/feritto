@@ -1,4 +1,5 @@
 //! Shared iced state and views. Only the window runner acquires native handles.
+mod clipboard;
 use feritto_core::*;
 use feritto_platform::{Backend, Platform};
 use feritto_store::Store;
@@ -19,12 +20,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// An xdg-activation token that came with a request to show a window. On Wayland it lets that
+/// window take focus; each token belongs to the request it arrived with.
+pub type ActivationToken = Option<String>;
+
 #[derive(Debug, Clone)]
 pub enum Control {
-    Show,
-    Toggle(PasteTarget),
+    Show(ActivationToken),
+    Toggle(PasteTarget, ActivationToken),
     Hide,
-    Settings,
+    Settings(ActivationToken),
     Quit,
     Pause,
     HistoryChanged,
@@ -61,7 +66,7 @@ enum Message {
     Event(window::Id, Event, iced::event::Status),
     Opened(window::Id),
     Native(Result<u32, String>),
-    Activated(Result<bool, String>),
+    Activated(window::Id, Result<(), String>),
     Target(Result<PasteTarget, String>),
     Prepared(Result<(), String>),
     Mapped,
@@ -73,7 +78,7 @@ enum Message {
     SearchFocused(bool),
     Accept(bool),
     Published(Result<(), String>),
-    Settings,
+    Settings(ActivationToken),
     Pause(bool),
     AutoPaste(bool),
     Dark(bool),
@@ -85,7 +90,7 @@ enum Message {
     Files(bool),
     Shortcut(PasteShortcut),
     UnverifiedPaste(bool),
-    PasteSearch(Result<String, String>),
+    PasteQuery(Result<String, String>),
     GrantPaste,
     MaxClips(String),
     Age(String),
@@ -105,6 +110,9 @@ struct App {
     /// focus an existing window, it exists only while shown.
     popup: Option<window::Id>,
     settings_window: Option<window::Id>,
+    /// Wayland: activation tokens for the popup and Settings windows that are being opened.
+    popup_token: ActivationToken,
+    settings_token: ActivationToken,
     xid: Option<u32>,
     visible: bool,
     pending_show: bool,
@@ -134,9 +142,10 @@ impl std::hash::Hash for ControlStream {
     }
 }
 
-pub fn run(services: Services, show: bool) -> iced::Result {
+/// Runs the GUI. `show` opens the popup at startup, activated with `token` on Wayland.
+pub fn run(services: Services, show: bool, token: ActivationToken) -> iced::Result {
     iced::daemon(
-        move || App::boot(services.clone(), show),
+        move || App::boot(services.clone(), show, token.clone()),
         App::update,
         App::view,
     )
@@ -166,7 +175,7 @@ async fn background<T: Send + 'static>(
         .map_err(|e| e.to_string())?
 }
 impl App {
-    fn boot(services: Services, show: bool) -> (Self, Task<Message>) {
+    fn boot(services: Services, show: bool, token: ActivationToken) -> (Self, Task<Message>) {
         let settings = services.settings.lock().unwrap().clone();
         let wayland = services.platform.backend() == Backend::Wayland;
         let (popup, task) = if wayland {
@@ -187,6 +196,8 @@ impl App {
             services,
             popup,
             settings_window: None,
+            popup_token: None,
+            settings_token: None,
             xid: None,
             visible: false,
             pending_show: show,
@@ -210,7 +221,7 @@ impl App {
         };
         let search = app.search();
         let show = if wayland && show {
-            app.show(None)
+            app.show(None, token)
         } else {
             Task::none()
         };
@@ -304,8 +315,10 @@ impl App {
             Message::PageReady,
         )
     }
-    fn show(&mut self, target: Option<PasteTarget>) -> Task<Message> {
+    fn show(&mut self, target: Option<PasteTarget>, token: ActivationToken) -> Task<Message> {
         let wayland = self.wayland();
+        // The newest request's token replaces an unused older one, which may have expired.
+        self.popup_token = token.filter(|_| wayland);
         if !wayland && self.xid.is_none() {
             self.pending_show = true;
             return Task::none();
@@ -337,7 +350,8 @@ impl App {
     fn prepare(&mut self) -> Task<Message> {
         if self.wayland() {
             if let Some(id) = self.popup {
-                return self.activate(id);
+                let token = self.popup_token.take();
+                return self.activate(id, token);
             }
             let (id, task) = window::open(popup_settings(true));
             self.popup = Some(id);
@@ -353,15 +367,19 @@ impl App {
             Message::Prepared,
         )
     }
-    /// Wayland: uses a pending xdg-activation token so the compositor focuses the popup.
-    fn activate(&self, id: window::Id) -> Task<Message> {
+    /// Wayland: activates a window with the token from the request that showed it, so the
+    /// compositor gives it focus. Without a token the compositor applies its own focus policy.
+    fn activate(&self, id: window::Id, token: ActivationToken) -> Task<Message> {
+        let Some(token) = token else {
+            return Task::done(Message::Activated(id, Ok(())));
+        };
         let platform = self.services.platform.clone();
         window::run(id, move |window| {
             let display = window.display_handle().map_err(|e| e.to_string())?;
             let handle = window.window_handle().map_err(|e| e.to_string())?;
-            platform.activate_window(display.as_raw(), handle.as_raw())
+            platform.activate_window(display.as_raw(), handle.as_raw(), &token)
         })
-        .map(Message::Activated)
+        .map(move |result| Message::Activated(id, result))
     }
     fn hide(&mut self, restore: bool) -> Task<Message> {
         self.visible = false;
@@ -437,16 +455,16 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Control(control) => match control {
-                Control::Show => self.show(None),
-                Control::Toggle(target) => {
+                Control::Show(token) => self.show(None, token),
+                Control::Toggle(target, token) => {
                     if self.visible {
                         self.hide(true)
                     } else {
-                        self.show(Some(target))
+                        self.show(Some(target), token)
                     }
                 }
                 Control::Hide => self.hide(true),
-                Control::Settings => self.update(Message::Settings),
+                Control::Settings(token) => self.update(Message::Settings(token)),
                 Control::Quit => self.update(Message::Quit),
                 Control::Pause => self.update(Message::Pause(!self.settings.paused)),
                 Control::HistoryChanged => {
@@ -471,13 +489,26 @@ impl App {
             Message::Opened(id) if Some(id) == self.popup && self.wayland() => {
                 self.visible = true;
                 self.mapped_at = Instant::now();
-                self.activate(id)
+                let token = self.popup_token.take();
+                self.activate(id, token)
             }
-            Message::Activated(result) => {
-                if let Err(error) = result {
-                    tracing::debug!(%error, "popup activation failed");
+            Message::Opened(id) if Some(id) == self.settings_window => {
+                let token = self.settings_token.take();
+                if self.wayland() {
+                    self.activate(id, token)
+                } else {
+                    Task::none()
                 }
-                self.update(Message::Mapped)
+            }
+            Message::Activated(id, result) => {
+                if let Err(error) = result {
+                    tracing::debug!(%error, "window activation failed");
+                }
+                if Some(id) == self.popup {
+                    self.update(Message::Mapped)
+                } else {
+                    Task::none()
+                }
             }
             Message::Opened(id) if Some(id) == self.popup => window::run(id, |handle| {
                 use window::raw_window_handle::RawWindowHandle;
@@ -496,7 +527,7 @@ impl App {
             Message::Native(Ok(xid)) => {
                 self.xid = Some(xid);
                 if self.pending_show {
-                    self.show(None)
+                    self.show(None, None)
                 } else {
                     Task::none()
                 }
@@ -647,10 +678,16 @@ impl App {
                 };
                 Task::none()
             }
-            Message::Settings => {
+            Message::Settings(token) => {
                 if let Some(id) = self.settings_window {
-                    window::gain_focus(id)
+                    // Wayland ignores focus requests without a token; X11 honours them.
+                    if self.wayland() && token.is_some() {
+                        self.activate(id, token)
+                    } else {
+                        window::gain_focus(id)
+                    }
                 } else {
+                    self.settings_token = token;
                     let (id, task) = window::open(window::Settings {
                         size: Size::new(620.0, 720.0),
                         min_size: Some(Size::new(500.0, 500.0)),
@@ -715,13 +752,14 @@ impl App {
                 self.settings.unverified_paste = value;
                 self.persist()
             }
-            Message::PasteSearch(Ok(text)) => {
+            Message::PasteQuery(Ok(text)) => {
+                // The search field had no focus, so there is no cursor: append, as typing does.
                 let mut query = self.query.clone();
-                query.push_str(&text.replace(['\r', '\n'], " "));
+                query.extend(text.chars().filter(|c| !c.is_control()));
                 let search = self.update(Message::Search(query));
                 Task::batch([search, widget::operation::focus(SEARCH_ID)])
             }
-            Message::PasteSearch(Err(error)) => {
+            Message::PasteQuery(Err(error)) => {
                 self.status = error;
                 Task::none()
             }
@@ -813,6 +851,7 @@ impl App {
         if Some(id) == self.settings_window {
             if matches!(event, Event::Window(window::Event::CloseRequested)) {
                 self.settings_window = None;
+                self.settings_token = None;
                 return window::close(id);
             }
             if matches!(
@@ -823,6 +862,7 @@ impl App {
                 })
             ) {
                 self.settings_window = None;
+                self.settings_token = None;
                 return window::close(id);
             }
             return Task::none();
@@ -880,22 +920,28 @@ impl App {
                     self.search_focused = true;
                     widget::operation::focus(SEARCH_ID)
                 }
-                // On Wayland the GUI has no clipboard connection; the platform service supplies it.
-                Key::Character(c)
-                    if self.wayland()
-                        && self.search_focused
-                        && modifiers.control()
-                        && !modifiers.alt()
-                        && c.eq_ignore_ascii_case("v") =>
-                {
-                    let platform = self.services.platform.clone();
-                    Task::perform(
-                        background(move || platform.clipboard_text()),
-                        Message::PasteSearch,
-                    )
-                }
                 Key::Character(c) if modifiers.control() && c == "," => {
-                    self.update(Message::Settings)
+                    self.update(Message::Settings(None))
+                }
+                // The search field captures its own paste while it has focus. A paste it ignored
+                // arrived while the list had focus, or before a just-opened popup focused the
+                // field; it still goes to the search instead of being lost.
+                Key::Character(c)
+                    if modifiers.control()
+                        && !modifiers.alt()
+                        && c.eq_ignore_ascii_case("v")
+                        && status == iced::event::Status::Ignored =>
+                {
+                    if self.wayland() {
+                        let platform = self.services.platform.clone();
+                        Task::perform(
+                            background(move || platform.clipboard_text()),
+                            Message::PasteQuery,
+                        )
+                    } else {
+                        iced::clipboard::read()
+                            .map(|text| Message::PasteQuery(Ok(text.unwrap_or_default())))
+                    }
                 }
                 Key::Character(_)
                     if !self.search_focused
@@ -917,9 +963,19 @@ impl App {
         }
     }
     fn view(&self, id: window::Id) -> Element<'_, Message> {
-        if Some(id) == self.settings_window {
-            return self.settings_view();
+        let content = if Some(id) == self.settings_window {
+            self.settings_view()
+        } else {
+            self.popup_view()
+        };
+        if self.wayland() {
+            // Text fields reach the clipboard through the platform service on Wayland.
+            clipboard::Bridge::new(content, self.services.platform.clone()).into()
+        } else {
+            content
         }
+    }
+    fn popup_view(&self) -> Element<'_, Message> {
         let header = row![
             column![
                 text("feritto").size(26),
@@ -940,7 +996,7 @@ impl App {
             .on_press(Message::Pause(!self.settings.paused))
             .style(button::secondary),
             button("Settings")
-                .on_press(Message::Settings)
+                .on_press(Message::Settings(None))
                 .style(button::secondary)
         ]
         .spacing(8)
@@ -1130,6 +1186,7 @@ impl App {
                     Capability::Available => "available".into(),
                     Capability::PermissionRequired(reason) =>
                         format!("permission required: {reason}"),
+                    Capability::Pending(reason) => format!("pending: {reason}"),
                     Capability::Unavailable(reason) => reason,
                 }
             ))

@@ -62,7 +62,9 @@ Locally exercised behavior:
   copies and CLIPBOARD clears. Background PRIMARY capture remains off.
 - A held-modifier/focus-change fixture confirms that losing the intended target
   leaves the clipboard ready and reports manual paste, without sending paste
-  keys to the unrelated newly focused window.
+  keys to the unrelated newly focused window. A copy-only publication made while
+  that paste waits cancels it: feritto still owns CLIPBOARD, so each paste is
+  bound to its publication rather than to ownership alone.
 - Failure paths keep the worker alive: a SAVE_TARGETS requestor that exits while
   its source stalls, and TARGETS lists naming unknown atoms, are settled (window
   released, requestor answered) instead of stopping the service. `TEXT` requests

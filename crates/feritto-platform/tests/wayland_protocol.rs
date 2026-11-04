@@ -418,6 +418,56 @@ fn multiple_formats_hints_and_primary() -> Result<()> {
     assert!(next_capture(&events, Duration::from_millis(600)).is_none());
     drop(ignored);
 
+    // A hint past the type limit cannot be read, so an overflowing offer is not captured.
+    let fillers: Vec<String> = (0..512)
+        .map(|i| format!("application/x-filler-{i}"))
+        .collect();
+    let mut overflowing: Vec<(&str, &[u8])> = vec![("text/plain;charset=utf-8", b"hunter3")];
+    overflowing.extend(fillers.iter().map(|m| (m.as_str(), b"".as_slice())));
+    overflowing.push(("x-kde-passwordManagerHint", b"secret"));
+    assert_eq!(overflowing.len(), 514);
+    let overflow = TestSource::own(&overflowing)?;
+    assert!(next_capture(&events, Duration::from_millis(600)).is_none());
+    drop(overflow);
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        paste(&[]),
+        None,
+        "an uncaptured offer must not be recovered"
+    );
+
+    // feritto's own text fields read the live selection, independent of capture settings.
+    service.configure(Settings {
+        paused: true,
+        ..Default::default()
+    });
+    service.set_paused(true).map_err(anyhow::Error::msg)?;
+    let mut fresh = copy_foreground("not in history ✓".as_bytes(), None)?;
+    wait_clipboard("not in history ✓".as_bytes(), &[]);
+    assert_eq!(
+        service.clipboard_text().map_err(anyhow::Error::msg)?,
+        "not in history ✓"
+    );
+    fresh.kill()?;
+    fresh.wait()?;
+    service.set_paused(false).map_err(anyhow::Error::msg)?;
+    service.configure(Settings {
+        capture: CapturePolicy {
+            text: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut untracked = copy_foreground(b"text capture off", None)?;
+    wait_clipboard(b"text capture off", &[]);
+    assert_eq!(
+        service.clipboard_text().map_err(anyhow::Error::msg)?,
+        "text capture off"
+    );
+    untracked.kill()?;
+    untracked.wait()?;
+    service.configure(Settings::default());
+
     // Shift+Insert publishes PRIMARY as well as CLIPBOARD; PRIMARY stays independent.
     service
         .paste(
@@ -513,6 +563,58 @@ fn verified_paste_reaches_the_target_window() -> Result<()> {
         .map_err(anyhow::Error::msg)?;
     let status = next_paste_result(&events);
     assert!(status.contains("cannot be confirmed"), "{status}");
+
+    // A copy-only publication while a paste waits voids that paste: its keys would paste the
+    // replacement. Unverified paste waits a fixed settle time, which leaves room for the copy.
+    let mut wev = Command::new("stdbuf")
+        .args(["-oL", "wev", "-f", "wl_keyboard:key"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = wev.stdout.take().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let end = Instant::now() + Duration::from_secs(5);
+    while service.active_window().map_err(anyhow::Error::msg)?.window == 0 {
+        assert!(Instant::now() < end, "no active target window");
+        thread::sleep(Duration::from_millis(50));
+    }
+    service.configure(Settings {
+        unverified_paste: true,
+        ..Default::default()
+    });
+    service
+        .paste(
+            Arc::new(Offer::text("paste A")),
+            PasteTarget::default(),
+            PasteShortcut::ControlV,
+        )
+        .map_err(anyhow::Error::msg)?;
+    service
+        .publish(Arc::new(Offer::text("copy B")))
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        next_paste_result(&events),
+        "Clipboard changed before paste; no keys were sent"
+    );
+    let end = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < end {
+        if let Ok(line) = line_rx.recv_timeout(Duration::from_millis(50)) {
+            assert!(
+                !line.contains("sym: v"),
+                "the stale paste sent keys: {line}"
+            );
+        }
+    }
+    wev.kill().ok();
+    wev.wait().ok();
+    wait_clipboard(b"copy B", &[]);
     service.shutdown();
     Ok(())
 }

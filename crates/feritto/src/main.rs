@@ -50,16 +50,10 @@ pub struct ContextData {
 }
 impl ContextData {
     fn handle_envelope(&self, envelope: Envelope) -> Result<Value> {
-        if matches!(
-            envelope.request,
-            Request::Show | Request::Toggle | Request::Settings
-        ) {
-            self.platform
-                .set_activation_token(envelope.activation_token);
-        }
-        self.handle(envelope.request)
+        self.handle(envelope.request, envelope.activation_token)
     }
-    fn handle(&self, request: Request) -> Result<Value> {
+    /// `token` activates the window that a Show, Toggle, or Settings request opens.
+    fn handle(&self, request: Request, token: Option<String>) -> Result<Value> {
         match request {
             Request::Status => Ok(
                 json!({"running":true,"version":env!("CARGO_PKG_VERSION"),"clips":self.store.call(|r|r.count())?,"paused":self.settings.lock().unwrap().paused,"capabilities":self.platform.capabilities()}),
@@ -120,12 +114,13 @@ impl ContextData {
             }
             request => {
                 let control = match request {
-                    Request::Show => Control::Show,
-                    Request::Toggle => {
-                        Control::Toggle(self.platform.active_window().map_err(anyhow::Error::msg)?)
-                    }
+                    Request::Show => Control::Show(token),
+                    Request::Toggle => Control::Toggle(
+                        self.platform.active_window().map_err(anyhow::Error::msg)?,
+                        token,
+                    ),
                     Request::Hide => Control::Hide,
-                    Request::Settings => Control::Settings,
+                    Request::Settings => Control::Settings(token),
                     Request::Quit => Control::Quit,
                     Request::Pause => Control::Pause,
                     _ => unreachable!(),
@@ -242,7 +237,7 @@ fn run() -> Result<()> {
                             }
                         }
                     }
-                    PlatformEvent::Toggle(target) => Control::Toggle(target),
+                    PlatformEvent::Toggle(target, token) => Control::Toggle(target, token),
                     PlatformEvent::Status(status) | PlatformEvent::PasteResult(status) => {
                         Control::Status(status)
                     }
@@ -253,8 +248,10 @@ fn run() -> Result<()> {
             }
         })?;
     tray::start(controls.clone());
+    // A launcher's token belongs to the first window this process opens for the request.
+    let mut startup_token = envelope.activation_token;
     if matches!(request, Request::Settings) {
-        controls.send(Control::Settings)?;
+        controls.send(Control::Settings(startup_token.take()))?;
     }
     tracing::info!(
         backend = match backend {
@@ -277,6 +274,7 @@ fn run() -> Result<()> {
             settings_path,
         },
         !daemon && !matches!(request, Request::Settings),
+        startup_token.filter(|_| !daemon),
     )?;
     platform.shutdown();
     Ok(())

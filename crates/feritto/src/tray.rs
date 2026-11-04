@@ -14,14 +14,14 @@ impl ksni::Tray for Tray {
         "edit-paste".into()
     }
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.controls.send(Control::Show);
+        let _ = self.controls.send(Control::Show(None));
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
         [
-            ("Show history", Control::Show),
+            ("Show history", Control::Show(None)),
             ("Pause / resume capture", Control::Pause),
-            ("Settings", Control::Settings),
+            ("Settings", Control::Settings(None)),
             ("Quit", Control::Quit),
         ]
         .into_iter()

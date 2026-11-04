@@ -2,6 +2,7 @@
 //! one at runtime from the session and hides the difference from the executable and UI.
 mod portal;
 mod wayland;
+use portal::PASTE_SUPERSEDED;
 mod x11;
 use anyhow::{Result, bail};
 use crossbeam_channel::Receiver;
@@ -114,26 +115,24 @@ impl Platform {
             Self::Wayland(s) => s.shutdown(),
         }
     }
-    /// Wayland only: an xdg-activation token from the launcher, CLI, or shortcut portal that
-    /// lets the next popup take keyboard focus.
-    pub fn set_activation_token(&self, token: Option<String>) {
-        if let Self::Wayland(s) = self {
-            s.set_activation_token(token);
-        }
-    }
-    /// Wayland only: activates a freshly opened window with the pending token, if any.
-    /// Must run on the thread that owns the window (inside iced's `window::run`).
+    /// Wayland only: activates a window with the xdg-activation token that came with the
+    /// request to show it (from a launcher, the CLI, or the shortcut portal). Must run on the
+    /// thread that owns the window (inside iced's `window::run`).
     pub fn activate_window(
         &self,
         display: RawDisplayHandle,
         window: RawWindowHandle,
-    ) -> ServiceResult<bool> {
+        token: &str,
+    ) -> ServiceResult<()> {
         match self {
-            Self::X11(_) => Ok(false),
-            Self::Wayland(s) => s.activate_window(display, window),
+            Self::X11(_) => Ok(()),
+            Self::Wayland(_) => {
+                activate_surface(display, window, token).map_err(|e| format!("{e:#}"))
+            }
         }
     }
-    /// Wayland only: current clipboard text for pasting into feritto's own search field.
+    /// Wayland only: the current clipboard text for feritto's own text fields, read from the
+    /// selection itself. It does not depend on history capture, pause, or format settings.
     pub fn clipboard_text(&self) -> ServiceResult<String> {
         match self {
             Self::X11(_) => Err("The X11 GUI reads the clipboard directly".into()),

@@ -130,6 +130,8 @@ pub struct Capture {
 pub enum Capability {
     Available,
     PermissionRequired(String),
+    /// A request, possibly a permission dialog, is still in progress.
+    Pending(String),
     Unavailable(String),
 }
 

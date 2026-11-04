@@ -17,13 +17,17 @@ loaded with dlopen, so builds need no Wayland development packages.
   idle polling. Protocol objects are bound once at startup and reported as capabilities.
 - `portal.rs`: a portal thread with a current-thread Tokio runtime and `ashpd`. It
   registers the host app ID `io.github.gh2302.Feritto`, binds the GlobalShortcuts
-  portal, and manages RemoteDesktop keyboard access. Portal dialogs never block
-  clipboard work. `FERITTO_NO_PORTALS=1` disables it for tests and minimal sessions.
+  portal, and manages RemoteDesktop keyboard access. Every call that can show a dialog
+  (shortcut binding, grant restore, grant request) runs as its own task. A dialog left
+  open never blocks clipboard work, shortcut activations, injections, or another dialog.
+  Its progress is reported as a `Pending` capability. `FERITTO_NO_PORTALS=1` disables
+  the portal thread for tests and minimal sessions.
 - UI: on Wayland the popup is created on show and closed on hide or focus loss. winit
   cannot hide or focus an existing Wayland window (`set_visible`/`focus_window` are
-  no-ops). xdg-activation tokens from the daemon environment, the CLI
-  (`XDG_ACTIVATION_TOKEN`, forwarded over IPC), or a shortcut portal activation are applied
-  to the new surface through the toolkit's display on a private event queue.
+  no-ops). An xdg-activation token travels with the request that brought it: the CLI
+  (`XDG_ACTIVATION_TOKEN`, forwarded over IPC) for show, toggle, or settings, or a shortcut
+  portal activation. It is applied to that request's window (popup or Settings, new or
+  already open) through the toolkit's display on a private event queue.
 
 ## Function mapping
 
@@ -41,6 +45,8 @@ loaded with dlopen, so builds need no Wayland development packages.
 
 - Own offers are recognized by a per-process marker type and never recaptured. The core
   treats the marker as a protocol type, so it is never stored or served from history.
+- An offer announcing more than 512 types is not captured. A hint could hide in the part
+  that is not retained, as with X11's oversized TARGETS lists.
 - `x-kde-passwordManagerHint` is read first, capped at 64 bytes. A `secret` value, an
   oversized hint, or a failed or timed-out hint read drops the generation. The ignore
   markers skip it. Every new generation invalidates older recovery data, so a secret,
@@ -49,6 +55,11 @@ loaded with dlopen, so builds need no Wayland development packages.
   This waits at most 1 s; feritto first asks the compositor to activate the target.
   If the target closed, the selection changed, or no injector exists, the clipboard stays
   ready and the user is told to paste manually.
+- Each paste is bound to the publication it was requested for. Replacing (including a
+  copy-only feritto publication), clearing, or losing the CLIPBOARD contents cancels it,
+  as does losing PRIMARY for Shift+Insert. A request queued to the portal thread rechecks
+  this, and a 500 ms deadline, before its first key. Portal injection releases every key
+  whose press was attempted, even after an error, and closes a failed session.
 - Repeated takeovers of feritto's selection (three within 2 s) switch to history-only
   mode, as on X11. Replaced own sources are destroyed rather than cancelled, so they never
   count as contention.
@@ -66,9 +77,14 @@ loaded with dlopen, so builds need no Wayland development packages.
   desynchronized libwayland's server object IDs. The GUI connection then died with
   `not a valid new object id … data_offer`, reproduced on sway. `feritto-ui` therefore
   enables winit's and softbuffer's Wayland features directly. iced's `x11` feature
-  still sets the window name, which winit uses as the Wayland `app_id`. Search-field Ctrl+V
-  reads the current text from the platform service: feritto's own offer or the fully
-  captured current generation.
+  still sets the window name, which winit uses as the Wayland `app_id`. Instead, each
+  window's content is wrapped in a widget that gives the text fields inside it a clipboard
+  backed by the platform service. The fields keep iced's own editing: paste inserts at the
+  cursor, and copy and cut publish the selected text. A Ctrl+V that arrives before a
+  just-opened popup has focused its search field is appended to the query instead of
+  being lost. Reads receive text from the current
+  selection owner like any paste, bounded to 1 s and 1 MiB. They do not depend on history
+  capture, pause, or format settings.
 - **Virtual keyboard created at startup.** Clients then already know the device and its
   keymap before the first paste. Creating it on demand let keys race ahead of client
   keyboard setup on a seat without other keyboards.
@@ -96,10 +112,16 @@ KWin 6.3.6 (`--virtual`). Clients: wl-clipboard 2.2.1, wev 1.0.0, wtype 0.4, foo
 - Secret, non-secret, and ignore hints behave as on X11. PRIMARY is published only for
   Shift+Insert and stays independent of later CLIPBOARD changes.
 - Verified Ctrl+V reaches a focused `wev`. A paste aimed at a closed window sends no keys.
+  A copy-only publication made while a paste waits cancels it, and no keys are sent.
+- An offer with a secret hint at type 514 (past the limit) is neither captured nor
+  recovered. Text-field reads return the live selection while capture is paused or
+  text capture is off.
 - End to end with the real binary: `--status` capabilities. The portal fallback degrades
   to a reason with no portal installed. `--add`/`--list --search`. `--toggle` opens a
   floating, focused popup inside the output. Typing searches; Enter pastes into foot with
-  Ctrl+Shift+V; focus returns. Search-field Ctrl+V pastes through the service.
+  Ctrl+Shift+V; focus returns. Search-field Ctrl+V pastes through the service, including
+  at the start of an existing query while capture is paused; Ctrl+C and Ctrl+X in the
+  search field set the clipboard.
   20 open/Escape cycles, close on focus loss, external capture with source-exit
   recovery, PNG round trip, settings without quitting, pause/resume, clear clipboard
   without resurrection, clear history, 0600/0700 private files, and restart durability.

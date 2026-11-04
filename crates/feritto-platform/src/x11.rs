@@ -1,3 +1,4 @@
+use crate::PASTE_SUPERSEDED;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use feritto_core::*;
@@ -39,7 +40,9 @@ x11rb::atom_manager! {
 #[derive(Debug, Clone)]
 pub enum PlatformEvent {
     Captured(Capture),
-    Toggle(PasteTarget),
+    /// The popup hotkey fired. Wayland's shortcut portal may supply an xdg-activation token
+    /// for the popup this opens.
+    Toggle(PasteTarget, Option<String>),
     Status(String),
     PasteResult(String),
 }
@@ -241,6 +244,8 @@ struct PendingPaste {
     target: PasteTarget,
     shortcut: PasteShortcut,
     deadline: Instant,
+    /// The publication this paste was requested for; keys are never sent for a later one.
+    publication: u64,
 }
 
 struct Worker {
@@ -264,6 +269,8 @@ struct Worker {
     primary_published: Option<Published>,
     outgoing: Vec<Outgoing>,
     paste: Option<PendingPaste>,
+    /// Advances whenever the CLIPBOARD contents feritto serves are replaced or lost.
+    publication: u64,
     owner: Window,
     timestamp: u32,
     manager: bool,
@@ -362,6 +369,7 @@ impl Worker {
             primary_published: None,
             outgoing: vec![],
             paste: None,
+            publication: 0,
             owner,
             timestamp: 0,
             manager,
@@ -513,6 +521,7 @@ impl Worker {
                             target,
                             shortcut,
                             deadline: Instant::now() + Duration::from_millis(650),
+                            publication: self.publication,
                         });
                     }
                 }
@@ -521,6 +530,7 @@ impl Worker {
                 self.cancel_incoming();
                 self.saved = None;
                 self.published = None;
+                self.supersede_paste();
                 let result = (|| -> Result<()> {
                     self.conn
                         .set_selection_owner(NONE, self.atoms.CLIPBOARD, CURRENT_TIME)?
@@ -639,7 +649,7 @@ impl Worker {
                     .as_ref()
                     .is_some_and(|(code, _)| *code == e.detail)
                 {
-                    self.emit(PlatformEvent::Toggle(self.active()?));
+                    self.emit(PlatformEvent::Toggle(self.active()?, None));
                 }
             }
             Event::MappingNotify(_) => self.register_hotkey(),
@@ -656,6 +666,7 @@ impl Worker {
             return Ok(());
         }
         self.published = None;
+        self.supersede_paste();
         let destruction = e.subtype == xfixes::SelectionEvent::SELECTION_WINDOW_DESTROY
             || e.subtype == xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE;
         if e.owner == NONE && destruction {
@@ -1252,6 +1263,8 @@ impl Worker {
     fn publish(&mut self, offer: &Offer, primary: bool) -> Result<()> {
         let timestamp = self.server_time()?;
         let published = self.build_published(offer, timestamp)?;
+        // From here on the old contents are being replaced; a paste waiting for them is void.
+        self.supersede_paste();
         self.conn
             .set_selection_owner(self.window, self.atoms.CLIPBOARD, timestamp)?
             .check()?;
@@ -1942,16 +1955,8 @@ impl Worker {
     }
     /// Returns the final paste status, or None to retry on the next tick.
     fn paste_tick(&self, paste: &PendingPaste, now: Instant) -> Result<Option<String>> {
-        let valid = self
-            .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)?
-            .reply()?
-            .owner
-            == self.window;
-        if !valid {
-            return Ok(Some(
-                "Clipboard changed before paste; no keys were sent".into(),
-            ));
+        if !self.paste_still_valid(paste)? {
+            return Ok(Some(PASTE_SUPERSEDED.into()));
         }
         let modifiers = self.conn.query_pointer(self.root)?.reply()?.mask;
         let held = u16::from(modifiers)
@@ -1967,21 +1972,52 @@ impl Worker {
             // Resolve keys first so the server is held only for the final focus check and XTest.
             let (mods, key) = self.paste_keys(paste.shortcut)?;
             self.conn.grab_server()?.check()?;
-            let result = if self.focus_is_within(paste.target.window) {
-                self.inject(&mods, key)
-            } else {
-                Err(anyhow::anyhow!("focus changed"))
+            // Under the grab no other client can change focus or take the selection.
+            let result = match self.paste_still_valid(paste) {
+                Ok(false) => Ok(Some(PASTE_SUPERSEDED.into())),
+                Ok(true) if self.focus_is_within(paste.target.window) => {
+                    Ok(Some(match self.inject(&mods, key) {
+                        Ok(()) => "Pasted into the previous window".into(),
+                        Err(error) => format!("Copied; press your paste shortcut ({error})"),
+                    }))
+                }
+                Ok(true) => Ok(Some(
+                    "Copied; press your paste shortcut (focus changed)".into(),
+                )),
+                Err(error) => Err(error),
             };
             self.conn.ungrab_server()?.check()?;
-            return Ok(Some(match result {
-                Ok(()) => "Pasted into the previous window".into(),
-                Err(error) => format!("Copied; press your paste shortcut ({error})"),
-            }));
+            return result;
         }
         if now >= paste.deadline {
             return Ok(Some("Copied; press your paste shortcut (focus or modifier release could not be confirmed)".into()));
         }
         Ok(None)
+    }
+    /// Whether the selection still holds the publication the paste was requested for. Owner
+    /// checks alone cannot tell a later feritto publication from the original one.
+    fn paste_still_valid(&self, paste: &PendingPaste) -> Result<bool> {
+        if paste.publication != self.publication {
+            return Ok(false);
+        }
+        let mut selections = vec![self.atoms.CLIPBOARD];
+        if matches!(paste.shortcut, PasteShortcut::ShiftInsert) {
+            selections.push(AtomEnum::PRIMARY.into());
+        }
+        for selection in selections {
+            if self.conn.get_selection_owner(selection)?.reply()?.owner != self.window {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// The served contents changed or were lost: a paste still waiting for them must not send
+    /// keys, which would paste whatever replaced them.
+    fn supersede_paste(&mut self) {
+        self.publication = self.publication.wrapping_add(1);
+        if self.paste.take().is_some() {
+            self.emit(PlatformEvent::PasteResult(PASTE_SUPERSEDED.into()));
+        }
     }
     fn orderly_shutdown(&mut self) -> Result<()> {
         if self.settings.clear_clipboard_on_exit {

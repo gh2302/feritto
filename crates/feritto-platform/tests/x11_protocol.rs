@@ -398,6 +398,51 @@ fn capture_serve_large_persist_clear_and_secret() -> Result<()> {
         }
     }
     wait_text(b"safe clipboard fallback");
+
+    // A copy-only publication while a paste waits voids that paste. feritto still owns the
+    // clipboard, so only the publication tells the two apart.
+    while events.try_recv().is_ok() {}
+    conn.xtest_fake_input(KEY_PRESS_EVENT, ctrl, 0, root, 0, 0, 0)?
+        .check()?;
+    service
+        .paste(
+            Arc::new(Offer::text("paste A")),
+            PasteTarget {
+                window: intended,
+                timestamp: 0,
+            },
+            PasteShortcut::ControlV,
+        )
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    while conn.get_input_focus()?.reply()?.focus != intended {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    service.publish(Arc::new(Offer::text("copy B"))).unwrap();
+    conn.xtest_fake_input(KEY_RELEASE_EVENT, ctrl, 0, root, 0, 0, 0)?
+        .check()?;
+    conn.flush()?;
+    let end = Instant::now() + Duration::from_secs(2);
+    let mut status = None;
+    while Instant::now() < end && status.is_none() {
+        if let Ok(PlatformEvent::PasteResult(result)) =
+            events.recv_timeout(Duration::from_millis(20))
+        {
+            status = Some(result);
+        }
+    }
+    assert_eq!(
+        status.as_deref(),
+        Some("Clipboard changed before paste; no keys were sent")
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    while let Some(event) = conn.poll_for_event()? {
+        if let x11rb::protocol::Event::KeyPress(key) = event {
+            assert_ne!(key.detail, v, "the stale paste sent keys");
+        }
+    }
+    wait_text(b"copy B");
     service.shutdown();
     Ok(())
 }

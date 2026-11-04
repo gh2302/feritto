@@ -135,6 +135,45 @@ def main():
             wait_for(lambda: pasted.read_text().endswith('\nneedle\n'), 'search field pasted the clipboard')
             source.terminate(); source.wait(); source = None
 
+            # Search-field paste inserts at the cursor and reads the live clipboard, even while
+            # capture is paused and the copied text never reaches the history.
+            cli('--pause')
+            wait_for(lambda: cli('--status')['paused'], 'capture paused')
+            source = sp.Popen(['wl-copy', '--foreground', 'nee'], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            wait_for(lambda: paste() == b'nee', 'uncaptured clipboard')
+            assert cli('--list', '--search', 'nee') == cli('--list', '--search', 'needle')
+            cli('--toggle')
+            wait_for(lambda: focused() == POPUP, 'popup focus')
+            time.sleep(0.3)  # Editing keys need the search field focused, not just the window.
+            run('wtype', '-d', '5', 'dle inside')
+            key('Home')
+            run('wtype', '-M', 'ctrl', 'v', '-m', 'ctrl')
+            time.sleep(0.3)
+            key('Return')
+            wait_for(lambda: focused() == TARGET and window(POPUP) is None, 'focus returned after cursor paste')
+            time.sleep(0.3)
+            key('Return')
+            wait_for(lambda: pasted.read_text().endswith('\nhaystack with needle inside\n'), 'paste at the cursor')
+            source.terminate(); source.wait(); source = None
+
+            # Copy and cut in the search field write the clipboard.
+            cli('--toggle')
+            wait_for(lambda: focused() == POPUP, 'popup focus')
+            time.sleep(0.3)
+            run('wtype', '-d', '5', 'copied from search')
+            run('wtype', '-M', 'ctrl', 'a', '-m', 'ctrl')
+            run('wtype', '-M', 'ctrl', 'c', '-m', 'ctrl')
+            wait_for(lambda: paste() == b'copied from search', 'Ctrl+C in the search field')
+            run('wtype', '-M', 'ctrl', 'a', '-m', 'ctrl')
+            run('wtype', '-d', '5', 'cut me')
+            run('wtype', '-M', 'ctrl', 'a', '-m', 'ctrl')
+            run('wtype', '-M', 'ctrl', 'x', '-m', 'ctrl')
+            wait_for(lambda: paste() == b'cut me', 'Ctrl+X in the search field')
+            key('Escape')
+            wait_for(lambda: focused() == TARGET and window(POPUP) is None, 'focus returned after copy and cut')
+            cli('--pause')
+            wait_for(lambda: not cli('--status')['paused'], 'capture resumed')
+
             # Escape closes the popup and returns focus; losing focus also closes it.
             durations = []
             for _ in range(int(os.environ.get('FERITTO_CYCLES', '20'))):
@@ -204,7 +243,7 @@ def main():
             cli('--quit'); app.wait(timeout=8)
             p95 = sorted(durations)[min(len(durations) - 1, int(len(durations) * 0.95))]
             print(json.dumps({'compositor': 'sway (headless)', 'cycles': len(durations), 'popup_focus_p95_ms': round(p95, 1),
-                              'checks': 'capabilities, portal fallback, capture, search, verified paste, search-field paste, focus, source exit, PNG, settings, pause, clear, privacy, restart'}, indent=2))
+                              'checks': 'capabilities, portal fallback, capture, search, verified paste, search-field paste at the cursor, copy and cut, focus, source exit, PNG, settings, pause, clear, privacy, restart'}, indent=2))
         except BaseException:
             app_log.flush()
             print((base / 'app.log').read_text(errors='replace'), file=sys.stderr)
