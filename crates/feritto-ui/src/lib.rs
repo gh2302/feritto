@@ -52,6 +52,9 @@ const VIEWPORT: f32 = 310.0;
 const OVERSCAN: usize = 4;
 const SEARCH_ID: &str = "search";
 const LIST_ID: &str = "history";
+/// How long the popup waits after losing focus before hiding, so a momentary keyboard
+/// leave/re-enter from the compositor does not close it.
+const BLUR_GRACE: Duration = Duration::from_millis(150);
 #[derive(Debug, Clone)]
 struct Page {
     generation: u64,
@@ -63,6 +66,7 @@ struct Page {
 enum Message {
     Control(Control),
     SearchDue(u64),
+    BlurDue(u64),
     Event(window::Id, Event, iced::event::Status),
     Opened(window::Id),
     Native(Result<u32, String>),
@@ -117,6 +121,9 @@ struct App {
     visible: bool,
     pending_show: bool,
     mapped_at: Instant,
+    /// Bumped on every popup focus change; a delayed blur only hides the popup if no focus
+    /// change followed it.
+    focus_epoch: u64,
     target: PasteTarget,
     query: String,
     generation: u64,
@@ -202,6 +209,7 @@ impl App {
             visible: false,
             pending_show: show,
             mapped_at: Instant::now(),
+            focus_epoch: 0,
             target: PasteTarget::default(),
             query: String::new(),
             generation: 0,
@@ -383,6 +391,7 @@ impl App {
     }
     fn hide(&mut self, restore: bool) -> Task<Message> {
         self.visible = false;
+        self.focus_epoch = self.focus_epoch.wrapping_add(1);
         self.pending_show = false;
         let task = match self.popup {
             Some(id) if self.wayland() => {
@@ -619,6 +628,13 @@ impl App {
             Message::Scroll(offset) => {
                 self.offset = offset;
                 self.load_page()
+            }
+            Message::BlurDue(epoch) => {
+                if epoch == self.focus_epoch && self.visible && self.settings_window.is_none() {
+                    self.hide(false)
+                } else {
+                    Task::none()
+                }
             }
             Message::SearchFocused(focused) => {
                 self.search_focused = focused;
@@ -872,12 +888,27 @@ impl App {
         }
         match event {
             Event::Window(window::Event::CloseRequested) => self.hide(true),
+            // Some compositors (wlroots before 0.18, e.g. sway 1.9) send a keyboard leave and
+            // re-enter whenever the active keyboard device changes, such as when a virtual
+            // keyboard or a second physical keyboard is used. Hide only if focus stays away.
+            Event::Window(window::Event::Focused) => {
+                self.focus_epoch = self.focus_epoch.wrapping_add(1);
+                Task::none()
+            }
             Event::Window(window::Event::Unfocused)
                 if self.visible
                     && self.settings_window.is_none()
                     && self.mapped_at.elapsed() > Duration::from_millis(200) =>
             {
-                self.hide(false)
+                self.focus_epoch = self.focus_epoch.wrapping_add(1);
+                let epoch = self.focus_epoch;
+                Task::perform(
+                    async move {
+                        tokio::time::sleep(BLUR_GRACE).await;
+                        epoch
+                    },
+                    Message::BlurDue,
+                )
             }
             Event::InputMethod(iced::advanced::input_method::Event::Preedit(value, _)) => {
                 self.composing = !value.is_empty();

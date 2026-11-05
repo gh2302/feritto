@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Sender, bounded};
 use feritto_core::*;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -272,7 +272,7 @@ impl Repository {
                         id: r.get(0)?,
                         preview: r.get(1)?,
                         captured_at: r.get(2)?,
-                        size: r.get(3)?,
+                        size: get_u64(r, 3)?,
                         starred: r.get(4)?,
                         search_truncated: r.get(5)?,
                         has_image: r.get(6)?,
@@ -370,7 +370,7 @@ impl Repository {
     pub fn count(&self) -> Result<u64> {
         Ok(self
             .db
-            .query_row("SELECT count(*) FROM clips", [], |r| r.get(0))?)
+            .query_row("SELECT count(*) FROM clips", [], |r| get_u64(r, 0))?)
     }
     pub fn cleanup(&mut self, settings: &Settings) -> Result<()> {
         let tx = self.db.transaction()?;
@@ -381,11 +381,7 @@ impl Repository {
         let mut stmt = tx.prepare("SELECT id,size,starred OR group_id IS NOT NULL OR sticky_global IS NOT NULL OR sticky_group IS NOT NULL OR shortcut IS NOT NULL FROM clips ORDER BY captured_at DESC,id DESC")?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, u64>(1)?,
-                    r.get::<_, bool>(2)?,
-                ))
+                Ok((r.get::<_, i64>(0)?, get_u64(r, 1)?, r.get::<_, bool>(2)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
@@ -415,6 +411,19 @@ fn thumbnail_png(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut output = std::io::Cursor::new(Vec::new());
     image.write_to(&mut output, image::ImageFormat::Png)?;
     Ok(output.into_inner())
+}
+
+/// Reads a non-negative SQLite integer as `u64`; rusqlite no longer
+/// implements `FromSql` for `u64` without its `fallible_uint` feature.
+fn get_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
 }
 
 #[cfg(test)]
