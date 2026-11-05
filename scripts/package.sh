@@ -57,7 +57,7 @@ Package: feritto
 Architecture: amd64
 Description: Native X11 and Wayland clipboard history manager
 CONTROL
-dependencies=$(cd "$temporary" && dpkg-shlibdeps --package=feritto -O -edebian/feritto/usr/bin/feritto)
+dependencies=$(cd "$temporary" && dpkg-shlibdeps -O -edebian/feritto/usr/bin/feritto)
 dependencies=${dependencies#shlibs:Depends=}
 deb_version=${version/-/\~}
 cat NOTICE LICENSE > "$package/usr/share/doc/feritto/copyright"
