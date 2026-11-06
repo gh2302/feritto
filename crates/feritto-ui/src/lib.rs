@@ -45,10 +45,14 @@ pub struct Services {
     pub settings_path: PathBuf,
 }
 
-const WIDTH: f32 = 720.0;
-const HEIGHT: f32 = 660.0;
-const ROW: f32 = 62.0;
-const VIEWPORT: f32 = 310.0;
+const WIDTH: f32 = 520.0;
+const ROW: f32 = 32.0;
+/// Height of the history list: ten rows.
+const VIEWPORT: f32 = ROW * 10.0;
+/// Height of the search bar below the list.
+const BAR: f32 = 38.0;
+/// List, divider, search bar, and the 1px window border on each side.
+const HEIGHT: f32 = VIEWPORT + 1.0 + BAR + 2.0;
 const OVERSCAN: usize = 4;
 const SEARCH_ID: &str = "search";
 const LIST_ID: &str = "history";
@@ -100,6 +104,7 @@ enum Message {
     Age(String),
     Star,
     Delete,
+    TogglePreview,
     ClearHistory,
     ConfirmClearHistory,
     ClearClipboard,
@@ -140,6 +145,8 @@ struct App {
     search_focused: bool,
     composing: bool,
     confirm_clear: bool,
+    /// Whether the side pane with the full text of the selected clip is shown (F3).
+    show_preview: bool,
 }
 
 struct ControlStream(crossbeam_channel::Receiver<Control>);
@@ -196,8 +203,7 @@ impl App {
             Capability::Unavailable(reason) if wayland => {
                 format!("Clipboard history cannot work on this compositor: {reason}")
             }
-            _ if wayland => "Copy something to start your history".into(),
-            _ => "Copy something to start your history · Ctrl+` opens feritto".into(),
+            _ => String::new(),
         };
         let mut app = Self {
             services,
@@ -226,6 +232,7 @@ impl App {
             search_focused: true,
             composing: false,
             confirm_clear: false,
+            show_preview: false,
         };
         let search = app.search();
         let show = if wayland && show {
@@ -661,6 +668,8 @@ impl App {
                 let Some(id) = self.selected else {
                     return Task::none();
                 };
+                // A new paste supersedes the previous status; failures set a new one.
+                self.status.clear();
                 let store = self.services.store.clone();
                 let platform = self.services.platform.clone();
                 let target = self.target;
@@ -686,12 +695,9 @@ impl App {
                 ))
             }
             Message::Published(result) => {
-                self.status = match result {
-                    Ok(()) => {
-                        "Copied; press your paste shortcut if automatic paste is unavailable".into()
-                    }
-                    Err(error) => error,
-                };
+                if let Err(error) = result {
+                    self.status = error;
+                }
                 Task::none()
             }
             Message::Settings(token) => {
@@ -719,13 +725,8 @@ impl App {
                 }
             }
             Message::Pause(value) => {
+                // The search placeholder shows the paused state.
                 self.settings.paused = value;
-                self.status = if value {
-                    "Capture paused"
-                } else {
-                    "Capture resumed"
-                }
-                .into();
                 self.persist()
             }
             Message::AutoPaste(value) => {
@@ -820,6 +821,10 @@ impl App {
                     }),
                     Message::Done,
                 )
+            }
+            Message::TogglePreview => {
+                self.show_preview = !self.show_preview;
+                Task::none()
             }
             Message::ClearHistory => {
                 self.confirm_clear = true;
@@ -947,6 +952,29 @@ impl App {
                     self.navigate(self.ids.len() as isize)
                 }
                 Key::Named(Named::Delete) if !self.search_focused => self.update(Message::Delete),
+                Key::Named(Named::F3) => self.update(Message::TogglePreview),
+                Key::Character(c) if modifiers.control() && c.eq_ignore_ascii_case("s") => {
+                    self.update(Message::Star)
+                }
+                // Ctrl+1 … Ctrl+9 paste the clip with that number.
+                Key::Character(c)
+                    if modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.shift()
+                        && matches!(
+                            c.as_str(),
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+                        ) =>
+                {
+                    let index = c.parse::<usize>().unwrap_or(1) - 1;
+                    match self.ids.get(index) {
+                        Some(&id) => {
+                            self.selected = Some(id);
+                            self.update(Message::Accept(false))
+                        }
+                        None => Task::none(),
+                    }
+                }
                 Key::Character(c) if modifiers.control() && c.eq_ignore_ascii_case("l") => {
                     self.search_focused = true;
                     widget::operation::focus(SEARCH_ID)
@@ -1007,191 +1035,171 @@ impl App {
         }
     }
     fn popup_view(&self) -> Element<'_, Message> {
-        let header = row![
-            column![
-                text("feritto").size(26),
-                text(if self.settings.paused {
-                    "Capture paused"
-                } else {
-                    "Your clipboard, within reach"
-                })
-                .size(12)
-            ]
-            .spacing(2),
-            space().width(Fill),
-            button(if self.settings.paused {
-                "Resume"
-            } else {
-                "Pause"
-            })
-            .on_press(Message::Pause(!self.settings.paused))
-            .style(button::secondary),
-            button("Settings")
-                .on_press(Message::Settings(None))
-                .style(button::secondary)
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
-        let search = text_input("Search clipboard history…", &self.query)
-            .id(SEARCH_ID)
-            .on_input(Message::Search)
-            .padding(12)
-            .size(16);
         let start = ((self.offset / ROW).floor() as usize)
             .saturating_sub(OVERSCAN)
             .min(self.ids.len());
         let end = (start + (VIEWPORT / ROW).ceil() as usize + OVERSCAN * 2).min(self.ids.len());
         let mut rows = column![space().height(start as f32 * ROW)].spacing(0);
-        for &id in &self.ids[start..end] {
+        for (index, &id) in self.ids[start..end].iter().enumerate() {
             let summary = self.summaries.get(&id);
             let selected = self.selected == Some(id);
             let preview = summary
-                .map(|s| bounded_text(&s.preview.replace(['\n', '\r'], " "), 180))
-                .unwrap_or_else(|| "Loading…".into());
-            let detail = summary
-                .map(|s| {
-                    format!(
-                        "{}{} · {}",
-                        if s.starred { "★ · " } else { "" },
-                        if s.has_image { "Image" } else { "Clip" },
-                        format_bytes(s.size)
-                    )
-                })
+                .map(|s| bounded_text(&s.preview.replace(['\n', '\r', '\t'], " "), 180))
                 .unwrap_or_default();
-            let mut content = row![].spacing(8).align_y(iced::Alignment::Center);
+            let mut content = row![
+                text(start + index + 1)
+                    .size(10)
+                    .width(24)
+                    .style(widget::text::secondary)
+            ]
+            .spacing(6)
+            .height(Fill)
+            .align_y(iced::Alignment::Center);
             if let Some(handle) = self.thumbnails.get(&id) {
                 content = content.push(
                     image(handle.clone())
-                        .width(48)
-                        .height(42)
+                        .width(40)
+                        .height(ROW - 8.0)
                         .content_fit(iced::ContentFit::Contain),
                 );
             }
             content = content.push(
-                column![
-                    text(preview)
-                        .size(14)
-                        .wrapping(widget::text::Wrapping::None),
-                    text(detail).size(11)
-                ]
-                .spacing(3)
-                .width(Fill),
+                text(preview)
+                    .size(13)
+                    .width(Fill)
+                    .wrapping(widget::text::Wrapping::None),
             );
-            let entry = button(content)
-                .on_press(Message::Select(id))
-                .width(Fill)
-                .height(ROW)
-                .padding(8)
-                .style(move |theme: &Theme, status| {
-                    if selected {
-                        button::primary(theme, status)
-                    } else {
-                        button::text(theme, status)
-                    }
-                });
-            rows = rows.push(entry);
+            if summary.is_some_and(|s| s.starred) {
+                content = content.push(text("★").size(12));
+            }
+            rows = rows.push(
+                button(content)
+                    .on_press(Message::Select(id))
+                    .width(Fill)
+                    .height(ROW)
+                    .padding([0, 8])
+                    .style(move |theme: &Theme, status| row_style(theme, status, selected)),
+            );
         }
         rows = rows.push(space().height((self.ids.len() - end) as f32 * ROW));
         let list: Element<'_, Message> = if self.ids.is_empty() {
+            let message = if !self.query.is_empty() {
+                "No matching clips"
+            } else if !self.status.is_empty() {
+                self.status.as_str()
+            } else {
+                "Copy something to start your history"
+            };
             container(
-                column![
-                    text(if self.query.is_empty() {
-                        "Your history starts with a copy."
-                    } else {
-                        "No matching clips."
-                    })
-                    .size(18),
-                    text("Text, screenshots, links, and rich clipboard formats.").size(13)
-                ]
-                .spacing(12),
+                text(bounded_text(message, 240))
+                    .size(13)
+                    .style(widget::text::secondary),
             )
             .center(Fill)
-            .height(VIEWPORT)
+            .padding(16)
             .into()
         } else {
             scrollable(rows)
                 .id(LIST_ID)
-                .height(VIEWPORT)
+                // A thin scrollbar beside the rows, not drawn over their text.
+                .direction(scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::new()
+                        .width(4)
+                        .scroller_width(4)
+                        .spacing(0),
+                ))
                 .on_scroll(|v| Message::Scroll(v.absolute_offset().y))
                 .into()
         };
-        let preview = self.preview_view();
-        let body = row![
-            container(list).width(Length::FillPortion(3)),
-            container(preview).width(Length::FillPortion(2)).padding(10)
-        ]
-        .spacing(12)
-        .height(VIEWPORT);
-        let footer = row![
-            text(format!("{} clips", self.ids.len())).size(12),
-            space().width(Fill),
-            button("Copy")
-                .on_press(Message::Accept(true))
-                .style(button::secondary),
-            button("Paste ↵").on_press(Message::Accept(false))
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
-        container(
-            column![
-                header,
-                search,
-                body,
-                footer,
-                text(bounded_text(&self.status, 160)).size(11),
-                text("↑↓ navigate · Enter paste · Shift+Enter copy · Esc close · Ctrl+L search")
-                    .size(11)
+        let body: Element<'_, Message> = if self.show_preview {
+            row![
+                container(list).width(Length::FillPortion(3)),
+                widget::rule::vertical(1),
+                container(self.preview_view())
+                    .width(Length::FillPortion(2))
+                    .padding(8)
             ]
-            .spacing(12),
-        )
-        .padding(18)
+            .into()
+        } else {
+            list
+        };
+        // Status messages replace the search hint, so the popup needs no extra status line.
+        let placeholder = if !self.status.is_empty() {
+            bounded_text(&self.status, 160)
+        } else if self.settings.paused {
+            "Search · capture paused".into()
+        } else {
+            "Search".into()
+        };
+        let bar = row![
+            text_input(&placeholder, &self.query)
+                .id(SEARCH_ID)
+                .on_input(Message::Search)
+                .padding([4, 8])
+                .size(14)
+                .style(search_style),
+            button(text("…").size(16))
+                .on_press(Message::Settings(None))
+                .padding([0, 10])
+                .style(button::text)
+        ]
+        .align_y(iced::Alignment::Center)
+        .padding([0, 4])
+        .height(BAR);
+        container(column![
+            container(body).height(VIEWPORT),
+            widget::rule::horizontal(1),
+            bar
+        ])
+        .padding(1)
         .width(Fill)
         .height(Fill)
+        .style(|theme: &Theme| {
+            let palette = theme.extended_palette();
+            container::Style {
+                background: Some(palette.background.base.color.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: palette.background.strong.color,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            }
+        })
         .into()
     }
     fn preview_view(&self) -> Element<'_, Message> {
-        let Some(id) = self.selected else {
-            return text("Select a clip to preview it.").size(13).into();
+        let Some(summary) = self.selected.and_then(|id| self.summaries.get(&id)) else {
+            return space().into();
         };
-        let Some(summary) = self.summaries.get(&id) else {
-            return text("Loading preview…").size(13).into();
-        };
-        let mut content = column![
-            row![
-                text("Preview").size(16),
-                space().width(Fill),
-                button(if summary.starred { "★" } else { "☆" })
-                    .on_press(Message::Star)
-                    .style(button::text),
-                button("Delete")
-                    .on_press(Message::Delete)
-                    .style(button::text)
-            ]
-            .spacing(4)
-        ]
-        .spacing(10);
-        if let Some(handle) = self.thumbnails.get(&id) {
+        let mut content = column![].spacing(8);
+        if let Some(handle) = self.thumbnails.get(&summary.id) {
             content = content.push(
                 image(handle.clone())
                     .width(Fill)
-                    .height(150)
+                    .height(140)
                     .content_fit(iced::ContentFit::Contain),
             );
         }
         content = content.push(
             scrollable(
                 text(&summary.preview)
-                    .size(13)
+                    .size(12)
                     .shaping(widget::text::Shaping::Advanced),
             )
             .height(Fill),
         );
+        let mut detail = format!(
+            "{} · {}",
+            format_bytes(summary.size),
+            summary.formats.join(" · ")
+        );
         if summary.search_truncated {
-            content =
-                content.push(text("Search covers the first 64 KiB of normalized text.").size(11));
+            detail.push_str(" · search covers the first 64 KiB");
         }
-        content = content.push(text(summary.formats.join(" · ")).size(10));
-        content.into()
+        content
+            .push(text(detail).size(10).style(widget::text::secondary))
+            .into()
     }
     fn settings_view(&self) -> Element<'_, Message> {
         let caps = self.services.platform.capabilities();
@@ -1288,6 +1296,13 @@ impl App {
                 ]
             ]
             .spacing(12),
+            text("Popup shortcuts").size(18),
+            text(
+                "Enter paste · Shift+Enter copy · Ctrl+1…9 paste by number · ↑↓ PageUp PageDown \
+                 select · Ctrl+S star · Delete remove · F3 preview · Ctrl+L search · \
+                 Ctrl+, settings · Esc close"
+            )
+            .size(12),
             text("Desktop capabilities").size(18),
             status("Backend", Capability::Unavailable(caps.backend)),
             status("Clipboard monitoring", caps.monitor),
@@ -1340,6 +1355,36 @@ fn popup_settings(visible: bool) -> window::Settings {
             ..Default::default()
         },
         ..Default::default()
+    }
+}
+/// A history row: flat, highlighted when selected and tinted on hover.
+fn row_style(theme: &Theme, status: button::Status, selected: bool) -> button::Style {
+    let palette = theme.extended_palette();
+    let (background, text_color) = if selected {
+        (Some(palette.primary.weak.color), palette.primary.weak.text)
+    } else if status == button::Status::Hovered {
+        (
+            Some(palette.background.weak.color),
+            palette.background.weak.text,
+        )
+    } else {
+        (None, palette.background.base.text)
+    };
+    button::Style {
+        background: background.map(Into::into),
+        text_color,
+        ..Default::default()
+    }
+}
+/// The search field blends into the bar beneath the list instead of drawing its own box.
+fn search_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let style = text_input::default(theme, status);
+    text_input::Style {
+        border: iced::Border {
+            width: 0.0,
+            ..style.border
+        },
+        ..style
     }
 }
 fn format_bytes(bytes: u64) -> String {

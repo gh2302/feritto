@@ -28,11 +28,13 @@ when `WAYLAND_DISPLAY` is set (even if Xwayland also sets `DISPLAY`), otherwise 
 One binary supports both; libwayland is loaded at runtime, so there are no extra build
 dependencies. Core types, storage, and the UI are shared by both adapters.
 
-Press **Ctrl+grave** (Ctrl+\`) to toggle the popup. Type to search, use arrow keys
-and PageUp/PageDown to select, then Enter or double-click to paste. Shift+Enter
-copies without automatic paste. Escape hides the popup. Ctrl+L returns to search;
-Ctrl+, opens settings. Home/End edit the query while search has focus and navigate
-the history otherwise. Star clips to protect them from automatic cleanup.
+Press **Ctrl+grave** (Ctrl+\`) to toggle the popup: a numbered history list with a
+search bar beneath it. Type to search, use arrow keys and PageUp/PageDown to select,
+then Enter or double-click to paste; Ctrl+1…9 pastes a clip by its number. Shift+Enter
+copies without automatic paste. Escape hides the popup. F3 shows the full text of the
+selected clip beside the list. Ctrl+L returns to search; Ctrl+, or the **…** button
+opens settings. Home/End edit the query while search has focus and navigate the history
+otherwise. Ctrl+S stars a clip to protect it from automatic cleanup; Delete removes it.
 
 Settings select capture families, pause capture, retention, theme, history-only
 coexistence, and the paste shortcut. The initial shortcut is Ctrl+V; terminals
