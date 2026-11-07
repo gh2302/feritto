@@ -247,6 +247,14 @@ struct PendingPaste {
     /// The publication this paste was requested for; keys are never sent for a later one.
     publication: u64,
 }
+/// Focus for a just-mapped popup. The map request iced sent can still be pending in the WM when
+/// the focus command arrives, and a WM ignores activation of a window it does not manage yet.
+struct PendingFocus {
+    window: Window,
+    placed: bool,
+    next_request: Instant,
+    deadline: Instant,
+}
 
 struct Worker {
     conn: RustConnection,
@@ -275,6 +283,7 @@ struct Worker {
     timestamp: u32,
     manager: bool,
     popup: Window,
+    popup_focus: Option<PendingFocus>,
     hotkey: Option<(u8, Vec<ModMask>)>,
     contention: VecDeque<Instant>,
     chunk_size: usize,
@@ -374,6 +383,7 @@ impl Worker {
             timestamp: 0,
             manager,
             popup: NONE,
+            popup_focus: None,
             hotkey: None,
             contention: VecDeque::new(),
             chunk_size,
@@ -482,8 +492,10 @@ impl Worker {
             }
             // Sleep on both native events and commands. Idle timeouts only detect a dropped handle;
             // active transfers/focus retries keep their bounded deadlines without polling at idle.
-            let active =
-                self.incoming.is_some() || !self.outgoing.is_empty() || self.paste.is_some();
+            let active = self.incoming.is_some()
+                || !self.outgoing.is_empty()
+                || self.paste.is_some()
+                || self.popup_focus.is_some();
             let timeout = rustix::event::Timespec {
                 tv_sec: if active { 0 } else { 1 },
                 tv_nsec: if active { 10_000_000 } else { 0 },
@@ -592,18 +604,17 @@ impl Worker {
             }
             Command::FocusPopup(window) => {
                 self.popup = window;
-                // The WM publishes frame extents only after the first map. Clamp the managed frame
-                // before activation; window type and state now belong to the WM and stay untouched.
-                if let Err(error) = self.place_popup(window, 0, 0) {
-                    tracing::debug!(%error, "popup placement after map failed");
-                }
-                // A fresh timestamp: the stored one may predate the WM's last user interaction.
-                let time = self.server_time().unwrap_or(self.timestamp);
-                if let Err(error) = self.request_focus(window, time) {
-                    tracing::debug!(%error, "popup focus request failed");
-                }
+                let now = Instant::now();
+                self.popup_focus = Some(PendingFocus {
+                    window,
+                    placed: false,
+                    next_request: now,
+                    deadline: now + Duration::from_millis(1500),
+                });
+                self.popup_focus_tick(now);
             }
             Command::Restore(target) => {
+                self.popup_focus = None;
                 let time = self.server_time().unwrap_or(target.timestamp);
                 if let Err(error) = self.request_focus(target.window, time) {
                     tracing::debug!(%error, "focus restoration failed");
@@ -1941,6 +1952,7 @@ impl Worker {
         for requestor in expired {
             self.release_requestor(requestor);
         }
+        self.popup_focus_tick(now);
         if let Some(paste) = self.paste.take() {
             match self.paste_tick(&paste, now) {
                 Ok(None) => self.paste = Some(paste),
@@ -1952,6 +1964,44 @@ impl Worker {
             }
         }
         Ok(())
+    }
+    /// Places and focuses a just-mapped popup once the WM manages it; retries until it has focus.
+    fn popup_focus_tick(&mut self, now: Instant) {
+        let Some(mut pending) = self.popup_focus.take() else {
+            return;
+        };
+        let window = pending.window;
+        if self.focus_is_within(window) {
+            return;
+        }
+        if now >= pending.deadline {
+            tracing::debug!("popup did not receive focus");
+            return;
+        }
+        let viewable = now >= pending.next_request
+            && self
+                .conn
+                .get_window_attributes(window)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_some_and(|a| a.map_state == MapState::VIEWABLE);
+        if viewable {
+            // The WM publishes frame extents only after the first map. Clamp the managed frame
+            // before activation; window type and state now belong to the WM and stay untouched.
+            if !pending.placed
+                && let Err(error) = self.place_popup(window, 0, 0)
+            {
+                tracing::debug!(%error, "popup placement after map failed");
+            }
+            pending.placed = true;
+            pending.next_request = now + Duration::from_millis(100);
+            // A fresh timestamp: the stored one may predate the WM's last user interaction.
+            let time = self.server_time().unwrap_or(self.timestamp);
+            if let Err(error) = self.request_focus(window, time) {
+                tracing::debug!(%error, "popup focus request failed");
+            }
+        }
+        self.popup_focus = Some(pending);
     }
     /// Returns the final paste status, or None to retry on the next tick.
     fn paste_tick(&self, paste: &PendingPaste, now: Instant) -> Result<Option<String>> {
